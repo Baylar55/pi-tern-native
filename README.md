@@ -18,6 +18,7 @@ Outside Tern, or in a normal shell block, pi is untouched.
 | Slash and `@` completion | Tern's native picker anchored at the caret, with the typed prefix highlighted |
 | Working indicator | Spinner, elapsed time and "Working…" above the composer, with a Stop button |
 | User messages | Right-aligned bubbles with a copy button, the send time, and "Copy message" on long-press |
+| Images | Pasted images (pi saves them to a temp file and puts its path in your message) become chips above the text, with a thumbnail, the pixel size and a remove button. The long path is hidden in the editor and taken out of the sent bubble, which shows the image as a thumbnail instead (click to zoom). Images the model reads appear inside the Read card, capped in height. The model still receives exactly the same message. |
 | Answers | Native markdown, collapsible thinking sections ("Thought for 4s"), and a hover row with copy, turn duration, tokens and cost |
 | Tool cards | Bash (command, output and Done/Exit footer with timing), Read/Write (file preview with syntax highlighting), Edit (real diff), and a generic card for any other tool |
 | Notices | pi's warnings, errors and status lines as icon notices, without the terminal colour codes |
@@ -89,11 +90,16 @@ This extension does the same for pi, without patching pi:
 4. **Diffs and sends frames.** `reconcile.ts` turns the tree into `add` / `del` / `set` / `text` operations, with
    omp's id scheme (`composer.line/input`). Unchanged subtrees are reused by identity and skipped. Frames
    respect Tern's acknowledgement credits.
-5. **Handles input.** Keystrokes reach pi as normal terminal input. Tern events (acks, resize, clicks on chips,
+5. **Sends large updates in pieces.** Opening a long session can produce megabytes of changes. They go out as
+   frames of about 160 KB, in order, as Tern acknowledges them. A single multi-megabyte frame arrived corrupted
+   through the Windows console layer.
+6. **Handles input.** Keystrokes reach pi as normal terminal input. Tern events (acks, resize, clicks on chips,
    copy, send and edit) are taken off the input stream before pi's editor sees them.
-6. **Brands it.** pi's logo is sent as a content-addressed SVG blob that Tern inlines. A small stylesheet sent
+7. **Brands it.** pi's logo is sent as a content-addressed SVG blob that Tern inlines, the same way pasted
+   images reach Tern: written to Tern's blob cache and announced, or sent inline when Tern lacks them. A small stylesheet sent
    with the TSP `styles` feature retints the glow, the start-screen haze and the model chip with pi's palette.
-   pi's working directory is reported with OSC 7.
+   pi's working directory is reported with OSC 7, and pi's mouse tracking is switched off so the touchpad and
+   wheel scroll the transcript.
 
 ### Files
 
@@ -134,9 +140,10 @@ per keystroke.
 - **Relies on pi internals.** It reads fields of pi's own components (for example a message component's
   `lastMessage`) and the order of the containers in pi's interactive mode, so a pi update may need small fixes.
 - **Not yet ported from omp:** the "Pseudo" shell view in Bash cards; rewind, retry and fork in the long-press
-  menu; images inside the transcript; and omp's rate (tok/s) chip.
-- **Not verified in a real window yet:** paste (especially images), Windows IME input, scrolling and the
-  thinking display. Tested so far in Tern's headless harness only.
+  menu; and omp's rate (tok/s) chip.
+- **Images are recognised by path:** any absolute path to an existing `.png`, `.jpg`, `.gif`, `.webp` or `.bmp`
+  file in a message is shown as an image (up to 20 MB). Paths to files that no longer exist stay as text.
+- **Not verified in a real window yet:** Windows IME input and the thinking display.
 - **macOS / Linux:** the shell launcher has not been tested.
 
 ## Credits

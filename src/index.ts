@@ -15,7 +15,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -40,6 +40,7 @@ import {
 	col,
 	encode,
 	encodeHello,
+	encodeRaw,
 	type Hello,
 	InboundParser,
 	icon,
@@ -151,6 +152,57 @@ const PI_STYLES = `
 		radial-gradient(circle, var(--l4) 0 1px, transparent 1.5px) !important;
 }
 `;
+
+/**
+ * Absolute paths to image files in message text: what pi inserts when you paste an image
+ * (`%TEMP%\pi-clipboard-<uuid>.png`), or any image path typed or dropped in. Only paths that exist
+ * on disk become attachments; anything else stays plain text.
+ */
+const IMAGE_PATH = /(?:[A-Za-z]:[\\/]|\\\\|\/)[^\s"'<>|*?]*?\.(?:png|jpe?g|gif|webp|bmp)(?![\w.])/gi;
+const IMAGE_MIME: Record<string, string> = {
+	png: "image/png",
+	jpg: "image/jpeg",
+	jpeg: "image/jpeg",
+	gif: "image/gif",
+	webp: "image/webp",
+	bmp: "image/bmp",
+};
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+/** Pixel size from the file header (PNG, GIF, JPEG, WebP, BMP), for chip labels and layout hints. */
+function imageSize(b: Buffer): { w: number; h: number } | undefined {
+	try {
+		if (b.length > 24 && b.readUInt32BE(0) === 0x89504e47) return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) };
+		if (b.length > 10 && b.toString("ascii", 0, 3) === "GIF") return { w: b.readUInt16LE(6), h: b.readUInt16LE(8) };
+		if (b.length > 26 && b.toString("ascii", 0, 2) === "BM") return { w: b.readInt32LE(18), h: Math.abs(b.readInt32LE(22)) };
+		if (b.length > 30 && b.toString("ascii", 0, 4) === "RIFF" && b.toString("ascii", 8, 12) === "WEBP") {
+			const kind = b.toString("ascii", 12, 16);
+			if (kind === "VP8X") return { w: 1 + b.readUIntLE(24, 3), h: 1 + b.readUIntLE(27, 3) };
+			if (kind === "VP8 ") return { w: b.readUInt16LE(26) & 0x3fff, h: b.readUInt16LE(28) & 0x3fff };
+			if (kind === "VP8L") {
+				const bits = b.readUInt32LE(21);
+				return { w: (bits & 0x3fff) + 1, h: ((bits >> 14) & 0x3fff) + 1 };
+			}
+		}
+		if (b[0] === 0xff && b[1] === 0xd8) {
+			let o = 2;
+			while (o + 9 < b.length) {
+				if (b[o] !== 0xff) {
+					o++;
+					continue;
+				}
+				const marker = b[o + 1]!;
+				if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+					return { h: b.readUInt16BE(o + 5), w: b.readUInt16BE(o + 7) };
+				}
+				o += 2 + b.readUInt16BE(o + 2);
+			}
+		}
+	} catch {
+		/* unreadable header */
+	}
+	return undefined;
+}
 
 /** Drop the trailing padding pi-tui adds to every line, keeping any closing SGR codes. */
 function trimRight(line: string): string {
@@ -314,7 +366,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (verb === "r" && body?.r === "blobs") {
-			if (!Array.isArray(body.have) || !body.have.includes(PI_LOGO.id)) sendLogoInline();
+			const asked = blobQueries.shift() ?? [];
+			const have: unknown[] = Array.isArray(body.have) ? body.have : [];
+			for (const id of asked) if (!have.includes(id)) sendBlobInline(id);
 			return;
 		}
 		if (verb !== "e" || !body || typeof body.ev !== "string") return;
@@ -358,6 +412,20 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const runAction = (act: string, target = "") => {
+		if (act === "remove-image") {
+			const n = Number(/img(\d+)/.exec(target)?.[1]);
+			const image = composerImages.find((a) => a.n === n);
+			if (composer && image) {
+				const text = composer.getText();
+				let from = image.from;
+				let to = image.to;
+				if (text[to] === " ") to++;
+				else if (from > 0 && text[from - 1] === " ") from--;
+				composer.setText(text.slice(0, from) + text.slice(to));
+				scheduleRender(0);
+			}
+			return;
+		}
 		if (act === "copy-message" || act === "copy-answer") {
 			const owner = target.split(/[./]/)[0] ?? "";
 			const value = copyTexts.get(owner);
@@ -395,6 +463,9 @@ export default function (pi: ExtensionAPI) {
 		unacked = [];
 		lastFocus = undefined;
 		reconciler.reset();
+		blobAnnounced.clear();
+		blobQueries.length = 0;
+		backlog = [];
 		const open = { id: sf, mode: "inline", title: "pi", role: "omp.session" };
 		log("out", "o", open);
 		rawWrite(encode("o", open));
@@ -408,23 +479,73 @@ export default function (pi: ExtensionAPI) {
 		scheduleRender(0);
 	};
 
-	/** Content-addressed blob: into Tern's blob cache when it has one, else inline (as omp does). */
-	const sendLogo = () => {
+	/**
+	 * Content-addressed blobs (as omp does): written into Tern's blob cache when it has one and
+	 * announced with a `blobs` query; sent inline (chunked) when Tern says it does not have them.
+	 */
+	const blobStore = new Map<string, { bytes: Buffer; mime: string }>();
+	const blobAnnounced = new Set<string>();
+	const blobQueries: string[][] = [];
+	const registerBlob = (bytes: Buffer, mime: string, knownId?: string): string => {
+		const id = knownId ?? createHash("sha256").update(bytes).digest("hex");
+		if (blobAnnounced.has(id)) return id;
+		blobAnnounced.add(id);
+		blobStore.set(id, { bytes, mime });
 		const dir = process.env.TERN_BLOB_DIR;
 		if (dir) {
 			try {
-				const file = join(dir, PI_LOGO.id);
-				if (!existsSync(file)) writeFileSync(file, PI_LOGO.bytes);
-				rawWrite(encode("q", { q: "blobs", ids: [PI_LOGO.id] }));
-				return;
+				const file = join(dir, id);
+				if (!existsSync(file)) writeFileSync(file, bytes);
+				blobQueries.push([id]);
+				rawWrite(encode("q", { q: "blobs", ids: [id] }));
+				return id;
 			} catch {
 				/* fall through to inline */
 			}
 		}
-		sendLogoInline();
+		sendBlobInline(id);
+		return id;
 	};
-	const sendLogoInline = () =>
-		rawWrite(`${APC}b;id=${PI_LOGO.id};mime=${PI_LOGO.mime};${PI_LOGO.bytes.toString("base64")}${ST}`);
+	const sendBlobInline = (id: string) => {
+		const blob = blobStore.get(id);
+		if (blob) rawWrite(encodeRaw("b", { id, mime: blob.mime }, blob.bytes.toString("base64"), apcLimit));
+	};
+	const sendLogo = () => void registerBlob(PI_LOGO.bytes, PI_LOGO.mime, PI_LOGO.id);
+
+	/** Image files referenced by path in a message, each registered as a blob. */
+	type Attachment = { n: number; path: string; from: number; to: number; id: string; w?: number; h?: number };
+	const imageFiles = new Map<string, { mtime: number; id: string; w?: number; h?: number } | null>();
+	const imageFile = (path: string) => {
+		try {
+			const st = statSync(path);
+			if (!st.isFile() || st.size === 0 || st.size > MAX_IMAGE_BYTES) return null;
+			const cached = imageFiles.get(path);
+			if (cached && cached.mtime === st.mtimeMs) return cached;
+			const bytes = readFileSync(path);
+			const ext = path.split(".").pop()!.toLowerCase();
+			const entry = { mtime: st.mtimeMs, id: registerBlob(bytes, IMAGE_MIME[ext] ?? "image/png"), ...imageSize(bytes) };
+			imageFiles.set(path, entry);
+			return entry;
+		} catch {
+			return null;
+		}
+	};
+	const findImages = (text: string): Attachment[] => {
+		const out: Attachment[] = [];
+		for (const m of text.matchAll(IMAGE_PATH)) {
+			const info = imageFile(m[0]);
+			if (!info) continue;
+			out.push({ n: out.length + 1, path: m[0], from: m.index!, to: m.index! + m[0].length, id: info.id, w: info.w, h: info.h });
+		}
+		return out;
+	};
+	/** Text with the attachment paths taken out and the leftover whitespace tidied. */
+	const withoutImages = (text: string, images: Attachment[]) => {
+		let out = text;
+		for (const a of [...images].reverse()) out = out.slice(0, a.from) + out.slice(a.to);
+		return out.replace(/[ \t]{2,}/g, " ").replace(/^[ \t]+|[ \t]+$/gm, "").trim();
+	};
+	let composerImages: Attachment[] = [];
 
 	const send = (ops: Op[]) => {
 		seq++;
@@ -441,16 +562,54 @@ export default function (pi: ExtensionAPI) {
 		}, delay);
 	};
 
+	/**
+	 * Large updates (opening a long session) are split into frames of about FRAME_BUDGET characters
+	 * and sent in order as Tern acknowledges them. One multi-megabyte frame arrived corrupted through
+	 * the Windows console layer ("malformed f body"), and smaller frames keep Tern responsive.
+	 */
+	const FRAME_BUDGET = 160_000;
+	let backlog: Op[][] = [];
+
+	/** True when a frame may go out now; otherwise arranges a retry when credits come back. */
+	const haveCredit = (): boolean => {
+		if (unacked.length < credits) return true;
+		const waited = Date.now() - unacked[0]!;
+		if (waited < 5000) {
+			if (!stallTimer) stallTimer = setTimeout(() => ((stallTimer = undefined), scheduleRender(0)), 5000 - waited);
+			return false;
+		}
+		unacked = []; // terminal stopped acknowledging: carry on without credits, as omp does
+		return true;
+	};
+
+	const flushBacklog = (): boolean => {
+		while (backlog.length > 0) {
+			if (!haveCredit()) return false;
+			send(backlog.shift()!);
+		}
+		return true;
+	};
+
+	const queueFrames = (ops: Op[]) => {
+		let batch: Op[] = [];
+		let size = 0;
+		for (const op of ops) {
+			const opSize = JSON.stringify(op).length;
+			if (batch.length > 0 && size + opSize > FRAME_BUDGET) {
+				backlog.push(batch);
+				batch = [];
+				size = 0;
+			}
+			batch.push(op);
+			size += opSize;
+		}
+		if (batch.length > 0) backlog.push(batch);
+	};
+
 	const render = () => {
 		if (!active || !ctxRef) return;
-		if (unacked.length >= credits) {
-			const waited = Date.now() - unacked[0]!;
-			if (waited < 5000) {
-				if (!stallTimer) stallTimer = setTimeout(() => ((stallTimer = undefined), scheduleRender(0)), 5000 - waited);
-				return;
-			}
-			unacked = []; // terminal stopped acknowledging: carry on without credits, as omp does
-		}
+		// Earlier frames first: the reconciler already counts them as sent.
+		if (!flushBacklog() || !haveCredit()) return;
 		let ops: Op[] = [];
 		const began = performance.now();
 		try {
@@ -468,7 +627,10 @@ export default function (pi: ExtensionAPI) {
 			ctxRef.ui.notify(`tern-native: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
 		if (logPath) log("perf", "render", { ms: +(performance.now() - began).toFixed(2), ops: ops.length });
-		if (ops.length > 0) send(ops);
+		if (ops.length > 0) {
+			queueFrames(ops);
+			flushBacklog();
+		}
 	};
 
 	// ---------- describe: transcript ----------
@@ -640,6 +802,8 @@ export default function (pi: ExtensionAPI) {
 		const time = clock(c.timestamp ?? Date.now());
 		const id = idOf(comp, "u");
 		copyTexts.set(id, c.text);
+		const images = findImages(c.text);
+		const body = images.length > 0 ? withoutImages(c.text, images) : c.text;
 		const stamp = c.timestamp ? new Date(c.timestamp) : undefined;
 		const node = n(
 			"card",
@@ -662,7 +826,16 @@ export default function (pi: ExtensionAPI) {
 					{ gap: "xs", align: "center", role: "omp.user.tools" },
 					"tools",
 				),
-				md(c.text, {}, "body"),
+				...(images.length > 0
+					? [
+							row(
+								images.map((a) => n("image", { blob: a.id, alt: `#${a.n}`, title: `#${a.n}`, w: a.w, h: a.h }, undefined, `i${a.n}`)),
+								{ gap: "sm", wrap: true, align: "start", role: "omp.user.images" },
+								"images",
+							),
+						]
+					: []),
+				...(body ? [md(body, {}, "body")] : []),
 			],
 			id,
 		);
@@ -850,6 +1023,14 @@ export default function (pi: ExtensionAPI) {
 		const args = c.args ?? {};
 		const out = resultText(c.result);
 		const name = c.toolName;
+		const resultImages = done
+			? (c.result!.content ?? [])
+					.filter((part: any) => part?.type === "image" && typeof part.data === "string")
+					.map((part: any) => {
+						const bytes = Buffer.from(part.data, "base64");
+						return { id: registerBlob(bytes, part.mimeType ?? "image/png"), ...imageSize(bytes) };
+					})
+			: [];
 		const base = {
 			role: `omp.tool.${name}`,
 			key: c.toolCallId,
@@ -877,6 +1058,16 @@ export default function (pi: ExtensionAPI) {
 						"run",
 					),
 				],
+				idOf(comp, "t"),
+			);
+		} else if (name === "read" && resultImages.length > 0) {
+			const path = args.path ?? args.file_path;
+			node = n(
+				"tool",
+				{ ...base, title: "Read", target: path, targetKind: "file", frame: "card", collapsed: false },
+				resultImages.map((img, i) =>
+					n("image", { blob: img.id, alt: path, title: path, w: img.w, h: img.h, max: { h: "14lines" }, role: "omp.tool.read.image" }, undefined, `img${i}`),
+				),
 				idOf(comp, "t"),
 			);
 		} else if (name === "read" || name === "write") {
@@ -1119,6 +1310,36 @@ export default function (pi: ExtensionAPI) {
 			),
 		);
 
+		// attachments: pasted images as chips, their paths hidden in the editor
+		const images = shell ? [] : findImages(value);
+		composerImages = images;
+		if (images.length > 0) {
+			kids.push(
+				row(
+					images.map((a) =>
+						n(
+							"card",
+							{ role: "omp.composer.chip", tone: "accent", head: [span(`Image #${a.n}`, "strong")], title: a.path },
+							[
+								n("image", { blob: a.id, alt: `Image #${a.n}`, title: a.path, w: a.w, h: a.h, max: { w: "12ch", h: "4lines" } }, undefined, "img"),
+								row(
+									[
+										...(a.w && a.h ? [spans([span(`${a.w}\u00d7${a.h}`, "dim")], { wrap: "none" }, "size")] : []),
+										icon("trash", { title: "Remove image", aria: "Remove image", actions: { click: "remove-image" } }, "remove"),
+									],
+									{ gap: "sm", align: "center" },
+									"foot",
+								),
+							],
+							`img${a.n}`,
+						),
+					),
+					{ gap: "sm", wrap: true, role: "omp.composer.chips" },
+					"chips",
+				),
+			);
+		}
+
 		// input line
 		kids.push(
 			row(
@@ -1126,7 +1347,20 @@ export default function (pi: ExtensionAPI) {
 					...(shell
 						? [row([spans([span("bash", "bashMode")], { wrap: "none" }, "label")], { role: "omp.composer.mode", gap: "xs", align: "center", title: "Runs in your shell" }, "mode")]
 						: []),
-					n("editor", { text: value, cursor, sendable: true, placeholder, maxLines: 18, lang: shell ? "bash" : undefined }, undefined, "input"),
+					n(
+						"editor",
+						{
+							text: value,
+							cursor,
+							sendable: true,
+							placeholder,
+							maxLines: 18,
+							lang: shell ? "bash" : undefined,
+							decor: images.length > 0 ? images.map((a) => ({ from: a.from, to: a.to, s: "hide" })) : undefined,
+						},
+						undefined,
+						"input",
+					),
 				],
 				{ role: "omp.composer.line", align: "start", gap: "sm" },
 				"line",

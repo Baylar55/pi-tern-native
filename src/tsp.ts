@@ -58,6 +58,24 @@ function isLowSurrogate(code: number): boolean {
 	return code >= 0xdc00 && code <= 0xdfff;
 }
 
+/**
+ * A raw (non-JSON) body with `key=value` params, chunked like omp's encoder when it exceeds the APC
+ * limit: `;c=<id>` on every part, `;m=1` on all but the last. Used for inline blobs (base64).
+ */
+export function encodeRaw(verb: string, params: Record<string, string>, body: string, limit = MAX_APC): string {
+	const head = Object.entries(params)
+		.map(([k, v]) => `;${k}=${v}`)
+		.join("");
+	if (body.length + head.length + 16 <= limit) return `${APC}${verb}${head};${body}${ST}`;
+	const id = (chunkSeq++).toString(36);
+	const size = Math.max(1024, limit - head.length - 64);
+	const parts: string[] = [];
+	for (let i = 0; i < body.length; i += size) parts.push(body.slice(i, i + size));
+	return parts
+		.map((part, i) => `${APC}${verb}${i === 0 ? head : ""};c=${id}${i < parts.length - 1 ? ";m=1" : ""};${part}${ST}`)
+		.join("");
+}
+
 export function encodeHello(version: string): string {
 	return encode("q", { q: "hello", v: [1], app: "pi", features: ["edit", "undo", "send"], ver: version });
 }
