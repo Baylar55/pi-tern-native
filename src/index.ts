@@ -344,11 +344,21 @@ export default function (pi: ExtensionAPI) {
 
 	// ---------- input: TSP events ----------
 	const onInput = (data: string) => {
+		if (usageOpen && data !== "\x1b" && !data.includes("\x1b_tsp") && !data.includes("\x1b]877")) {
+			// typing (or any other key) closes the card and carries on as usual
+			usageOpen = false;
+			scheduleRender(0);
+		}
 		if (!data.includes("\x1b")) return parser.buffering ? feed(data) : undefined;
 		return feed(data);
 	};
 
 	const feed = (data: string) => {
+		if (usageOpen && data === "\x1b") {
+			usageOpen = false;
+			scheduleRender(0);
+			return { consume: true };
+		}
 		const { messages, rest } = parser.feed(data);
 		for (const m of messages) handleInbound(m.verb, m.body);
 		if (rest === data) return undefined;
@@ -439,6 +449,12 @@ export default function (pi: ExtensionAPI) {
 		switch (act) {
 			case "submit":
 				composer?.handleInput("\r");
+				break;
+			case "status.cost":
+				usageOpen = !usageOpen;
+				break;
+			case "usage.close":
+				usageOpen = false;
 				break;
 			case "interrupt":
 				ctxRef?.abort();
@@ -617,7 +633,8 @@ export default function (pi: ExtensionAPI) {
 			const dock = describeDock();
 			reconciler.region("dock", dock.nodes, ops);
 			const overlay = autocompleteOverlay();
-			reconciler.region("layer", overlay ? [overlay] : [], ops);
+			const card = usageCard();
+			reconciler.region("layer", [overlay, card].filter((x): x is TspNode => !!x), ops);
 			if (dock.focus !== lastFocus) {
 				ops.push(["focus", dock.focus]);
 				lastFocus = dock.focus;
@@ -1199,6 +1216,70 @@ export default function (pi: ExtensionAPI) {
 			"hud",
 		);
 
+	/** The usage card: the full numbers behind the cost chip, as a small popover above the composer. */
+	let usageOpen = false;
+	const usageCard = (): TspNode | null => {
+		if (!usageOpen || !ctxRef) return null;
+		const ctx = ctxRef;
+		const u = sessionUsage();
+		const ctxUsage = ctx.getContextUsage();
+		const window = ctxUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+		const pct = ctxUsage?.percent ?? null;
+		const auto = autoCompact(window);
+		const kv = (rows: [string, string | undefined][]) =>
+			n("kv", { items: rows.filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => ({ k: [span(k, "muted")], v })) });
+		const head = (label: string, id: string) => spans([span(label, "strong")], { wrap: "none" }, id);
+		return n(
+			"overlay",
+			{ anchor: "bottom", size: "sm", modal: false, role: "omp.overlay.usage" },
+			[
+				col(
+					[
+						row(
+							[
+								spans([span("Usage", "strong")], { wrap: "none" }, "title"),
+								row([], { grow: 1 }, "fill"),
+								row([n("kbd", { keys: ["escape"] }, undefined, "key"), text("Close", {}, "label")], { gap: "xs", align: "center", title: "Close", actions: { click: "usage.close" } }, "close"),
+							],
+							{ align: "center", gap: "sm" },
+							"head",
+						),
+						head("Cost", "cost-head"),
+						n(
+							"kv",
+							{
+								items: [
+									{ k: [span("Session", "muted")], v: u.cost > 0 ? money(u.cost) : "\u2014" },
+									{ k: [span("Billing", "muted")], v: u.sub ? "Subscription login: estimated at API prices" : "API key" },
+								],
+							},
+							undefined,
+							"cost",
+						),
+						head("Tokens", "tokens-head"),
+						{ ...kv([
+							["Input (uncached)", u.input.toLocaleString()],
+							["Output", u.output.toLocaleString()],
+							["Cache read", u.cacheRead ? u.cacheRead.toLocaleString() : undefined],
+							["Cache written", u.cacheWrite ? u.cacheWrite.toLocaleString() : undefined],
+							["Cache hit (last request)", u.hit !== undefined ? pct1(u.hit) : undefined],
+							["Requests", String(u.requests)],
+						]), id: "tokens" },
+						head("Context", "context-head"),
+						{ ...kv([
+							["Used", pct === null ? "unknown" : `${pct1(pct)} \u00b7 ${fmtTokens(ctxUsage?.tokens ?? 0)} of ${fmtTokens(window)}`],
+							["Auto-compaction", auto.on ? (auto.at !== undefined ? `on \u00b7 starts at ${Math.round(auto.at * 100)}%` : "on") : "off"],
+							["Model", ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined],
+						]), id: "context" },
+					],
+					{ gap: "sm", role: "omp.usage" },
+					"body",
+				),
+			],
+			"usage",
+		);
+	};
+
 	/** pi's autocomplete as omp's native picker: a `list` overlay in the layer, anchored at the caret. */
 	const autocompleteOverlay = (): TspNode | null => {
 		const ed = composer;
@@ -1259,6 +1340,63 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
+	/**
+	 * Session usage, computed exactly like pi's footer: totals over every entry (assistant messages,
+	 * tool results with usage, compactions, branch summaries, usage entries), and the cache hit rate
+	 * of the latest assistant request. Cached per entry count and leaf.
+	 */
+	type Usage = {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		cost: number;
+		hit?: number;
+		requests: number;
+		sub: boolean;
+	};
+	let usageCache: { key: string; usage: Usage } | undefined;
+	const sessionUsage = (): Usage => {
+		const ctx = ctxRef!;
+		const entries = ctx.sessionManager.getEntries();
+		const sub = !!ctx.model && (ctx.model.provider === "kimi-coding" || ctx.modelRegistry.isUsingOAuth(ctx.model));
+		const key = `${entries.length}|${ctx.sessionManager.getLeafId?.() ?? ""}|${sub}`;
+		if (usageCache?.key === key) return usageCache.usage;
+		const u: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, requests: 0, sub };
+		const add = (x: any) => {
+			if (!x) return;
+			u.input += x.input ?? 0;
+			u.output += x.output ?? 0;
+			u.cacheRead += x.cacheRead ?? 0;
+			u.cacheWrite += x.cacheWrite ?? 0;
+			u.cost += x.cost?.total ?? 0;
+		};
+		for (const e of entries as any[]) {
+			if (e.type === "usage") add(e.usage);
+			else if (e.type === "message" && e.message?.role === "assistant") {
+				const m = e.message.usage;
+				add(m);
+				if (!m) continue;
+				const prompt = (m.input ?? 0) + (m.cacheRead ?? 0) + (m.cacheWrite ?? 0);
+				u.hit = prompt > 0 ? ((m.cacheRead ?? 0) / prompt) * 100 : undefined;
+				u.requests++;
+			} else if (e.type === "message" && e.message?.role === "toolResult" && e.message.usage) add(e.message.usage);
+			else if ((e.type === "branch_summary" || e.type === "compaction") && e.usage) add(e.usage);
+		}
+		usageCache = { key, usage: u };
+		return u;
+	};
+	const pct1 = (v: number) => `${v.toFixed(1)}%`;
+	const money = (v: number) => `$${v.toFixed(2)}`;
+	const autoCompact = (window: number) => {
+		const settings = (pi.getSettings?.() ?? {}) as { compaction?: { enabled?: boolean; reserveTokens?: number } };
+		if (settings.compaction?.enabled === false) return { on: false as const };
+		const reserve = settings.compaction?.reserveTokens ?? 16_384;
+		return { on: true as const, at: window > 0 ? Math.max(0, Math.min(1, (window - reserve) / window)) : undefined };
+	};
+	/** The cache hit rate is only news when it drops after the cache has been warm. */
+	const cacheTrouble = (u: Usage) => u.requests >= 2 && u.hit !== undefined && u.hit < 80 && u.cacheRead + u.cacheWrite > 0;
+
 	/** Where pi's auto-compaction starts (compaction.reserveTokens free), as a meter mark. */
 	const compactMark = (window: number) => {
 		if (!window) return undefined;
@@ -1301,8 +1439,13 @@ export default function (pi: ExtensionAPI) {
 					label: pct === null ? undefined : `${Math.round(pct)}%`,
 					total: window ? fmtTokens(window) : undefined,
 					title: [
-						pct === null ? "Context usage unknown" : `Context ${Math.round(pct)}% used`,
+						pct === null ? "Context usage unknown" : `Context ${pct1(pct)} used`,
 						window ? `${fmtTokens(usage?.tokens ?? 0)} of ${fmtTokens(window)} tokens` : "No context window",
+						(() => {
+							const auto = autoCompact(window);
+							if (!auto.on) return "Auto-compaction off";
+							return auto.at !== undefined ? `Auto-compaction on \u00b7 starts at ${Math.round(auto.at * 100)}%` : "Auto-compaction on";
+						})(),
 					].join("\n"),
 				},
 				undefined,
@@ -1387,6 +1530,27 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const facts: TspNode[] = [];
+		{
+			const u = sessionUsage();
+			if (cacheTrouble(u)) {
+				facts.push(
+					n(
+						"seg",
+						{
+							role: "omp.composer.fact",
+							priority: 1100,
+							icon: "warning",
+							tone: "warning",
+							spans: [span(`cache ${Math.round(u.hit!)}%`, "warning")],
+							title: `The last request reused only ${pct1(u.hit!)} of the prompt from the cache, so most of the context was sent at full price.\nThis usually follows a model switch, a compaction or a changed system prompt, and recovers on the next turn.\nClick for details`,
+							actions: { click: "status.cost" },
+						},
+						undefined,
+						"cache",
+					),
+				);
+			}
+		}
 		const branch = footerData?.getGitBranch() ?? git.branch;
 		if (branch) {
 			const dirty = git.untracked + git.changed > 0;
@@ -1402,15 +1566,23 @@ export default function (pi: ExtensionAPI) {
 		}
 		bar.push(n("status", { role: "omp.composer.extras", transparent: true, grow: 1 }, facts, "extras"));
 
-		let cost = 0;
-		for (const e of ctx.sessionManager.getBranch()) {
-			if (e.type === "message" && e.message.role === "assistant") cost += (e.message as AssistantMessage).usage?.cost?.total ?? 0;
-		}
+		const u = sessionUsage();
+		const costTitle = [
+			`Session cost  ${u.cost > 0 ? money(u.cost) : "\u2014"}${u.sub ? " (subscription)" : ""}`,
+			`Tokens  ${fmtTokens(u.input)} in \u00b7 ${fmtTokens(u.output)} out`,
+			u.cacheRead + u.cacheWrite > 0
+				? `Prompt cache  ${fmtTokens(u.cacheRead)} read \u00b7 ${fmtTokens(u.cacheWrite)} written${u.hit !== undefined ? ` \u00b7 ${pct1(u.hit)} hit` : ""}`
+				: undefined,
+			"Click for details",
+		]
+			.filter(Boolean)
+			.join("\n");
 		bar.push(
-			spans(cost > 0 ? [span(COST_ICON, "icon"), span(cost.toFixed(2))] : [span(COST_ICON, "icon")], {
+			spans(u.cost > 0 ? [span(COST_ICON, "icon"), span(u.cost.toFixed(2), u.sub ? "dim" : undefined)] : [span(COST_ICON, "icon")], {
 				role: "omp.composer.usage",
 				wrap: "none",
-				title: `Session cost ${cost > 0 ? `$${cost.toFixed(2)}` : "—"}`,
+				title: costTitle,
+				actions: { click: "status.cost" },
 			}, "usage"),
 		);
 		bar.push(

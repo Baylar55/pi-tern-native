@@ -14,7 +14,8 @@ Outside Tern, or in a normal shell block, pi is untouched.
 | Area | In Tern |
 |---|---|
 | Start screen | pi's pixel logo in coral, blue and yellow, with Tern's intro animation, a dotted background, a rotating tip and the composer centred with a glow in pi's colours |
-| Composer | Native editor with a "Message pi" placeholder (or the session name), context meter with omp's warning thresholds, model chip (click to switch), thinking-effort chip (click to cycle), git branch with change counts, other extensions' statuses, session cost, and Send, which turns into Stop while pi works |
+| Composer | Native editor with a "Message pi" placeholder (or the session name), context meter with omp's warning thresholds (hover for tokens used and when auto-compaction starts), model chip (click to switch), thinking-effort chip (click to cycle), git branch with change counts, other extensions' statuses, session cost, and Send, which turns into Stop while pi works |
+| Usage | The bar keeps only the cost. Hovering it shows the session's numbers the way pi's footer counts them (tokens in and out, prompt cache read and written, cache hit rate); clicking it opens a usage card with the full breakdown, billing and context, closed with Escape. On a subscription login the cost is dimmed, since it is an estimate at API prices. A "cache 41%" warning chip appears only when the cache hit rate of the last request drops below 80% |
 | Slash and `@` completion | Tern's native picker anchored at the caret, with the typed prefix highlighted |
 | Working indicator | Spinner, elapsed time and "Working…" above the composer, with a Stop button |
 | User messages | Right-aligned bubbles with a copy button, the send time, and "Copy message" on long-press |
