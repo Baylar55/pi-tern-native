@@ -1,0 +1,11 @@
+{
+	"name": "pi-tern-native",
+	"version": "0.1.0",
+	"description": "Native Tern UI for the pi coding agent: pi draws its transcript, composer and tool cards as Tern surface widgets, the way oh-my-pi does.",
+	"private": true,
+	"type": "module",
+	"keywords": ["pi-package", "pi", "pi-coding-agent", "tern", "tsp"],
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	}
+}

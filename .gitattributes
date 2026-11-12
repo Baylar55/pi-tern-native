@@ -1,0 +1,3 @@
+* text=auto eol=lf
+*.cmd text eol=crlf
+bin/pi-tern-native text eol=lf

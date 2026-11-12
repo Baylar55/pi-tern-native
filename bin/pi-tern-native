@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Runs pi with the native Tern surface (the tern-native extension).
+# Point Tern's agent command at this file. Untested on macOS/Linux so far.
+PI_TERN_NATIVE=1 exec pi "$@"
