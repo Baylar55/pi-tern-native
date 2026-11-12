@@ -1276,7 +1276,10 @@ export default function (pi: ExtensionAPI) {
 			terminal.write = original;
 		};
 		// Inline surfaces live on the main screen: leave the alternate screen if pi entered it.
-		rawWrite("\x1b[?1049l\x1b[2J\x1b[H");
+		// pi's fullscreen mode (its default) also turns on mouse tracking; while that is on, Tern
+		// sends wheel and touchpad scrolling to the program as mouse codes instead of scrolling the
+		// transcript. Tern owns scrolling now, so switch every tracking mode off.
+		rawWrite("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?1049l\x1b[2J\x1b[H");
 		active = true;
 		openSurface();
 		reportCwd(ctx.cwd);
