@@ -23,17 +23,24 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	AssistantMessageComponent,
 	BashExecutionComponent,
+	BranchSummaryMessageComponent,
+	CompactionSummaryMessageComponent,
 	CustomEditor,
+	CustomMessageComponent,
 	DynamicBorder,
 	type ExtensionAPI,
 	type ExtensionContext,
+	ExtensionInputComponent,
+	ExtensionSelectorComponent,
 	type KeybindingsManager,
+	ModelSelectorComponent,
 	type ReadonlyFooterDataProvider,
+	SkillInvocationMessageComponent,
 	ToolExecutionComponent,
 	UserMessageComponent,
 	VERSION,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, type EditorTheme, Markdown, Spacer, type TUI, Text } from "@earendil-works/pi-tui";
+import { type Component, type EditorTheme, Markdown, SelectList, Spacer, type TUI, Text } from "@earendil-works/pi-tui";
 import { Reconciler } from "./reconcile.ts";
 import {
 	APC,
@@ -283,6 +290,7 @@ export default function (pi: ExtensionAPI) {
 	let tuiRef: TUI | undefined;
 	let footerData: ReadonlyFooterDataProvider | undefined;
 	let composer: TernComposer | undefined;
+	let keybindingsRef: KeybindingsManager | undefined;
 	let hello: Hello | undefined;
 	let active = false;
 	let sf = "";
@@ -307,7 +315,7 @@ export default function (pi: ExtensionAPI) {
 	const ids = new WeakMap<object, string>();
 	let idSeq = 0;
 	const nodeCache = new WeakMap<object, { key: string; node: TspNode }>();
-	const toolClock = new Map<string, { start: number; end?: number }>();
+	const toolClock = new WeakMap<object, { start: number; end?: number }>();
 
 	const idOf = (o: object, prefix: string) => {
 		let id = ids.get(o);
@@ -316,6 +324,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const logPath = process.env.PI_TERN_NATIVE_LOG;
+	const logVerbose = process.env.PI_TERN_NATIVE_LOG_VERBOSE === "1";
 	const log = (dir: string, verb: string, body: unknown) => {
 		if (!logPath) return;
 		try {
@@ -339,11 +348,13 @@ export default function (pi: ExtensionAPI) {
 			super(tui, theme, keybindings);
 			tuiRef = tui;
 			composer = this;
+			keybindingsRef = keybindings;
 		}
 	}
 
 	// ---------- input: TSP events ----------
 	const onInput = (data: string) => {
+		if (logVerbose && !data.includes("\x1b]877") && !data.includes("\x1b_tsp")) log("in", "raw", { data });
 		if (usageOpen && data !== "\x1b" && !data.includes("\x1b_tsp") && !data.includes("\x1b]877")) {
 			// typing (or any other key) closes the card and carries on as usual
 			usageOpen = false;
@@ -366,7 +377,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const handleInbound = (verb: string, body: any) => {
-		if (!(verb === "e" && body?.ev === "ack")) log("in", verb, body);
+		if (logVerbose || !(verb === "e" && body?.ev === "ack")) log("in", verb, body);
 		if (verb === "r" && body?.r === "hello") {
 			if (helloWaiter) {
 				const w = helloWaiter;
@@ -399,21 +410,26 @@ export default function (pi: ExtensionAPI) {
 				}
 				return;
 			case "action":
-				return runAction(String(body.act ?? ""), String(body.id ?? ""));
+				return runAction(String(body.act ?? ""), String(body.id ?? ""), typeof body.value === "string" ? body.value : undefined);
+			case "select":
+			case "activate":
+				return pick(body.ev === "activate", String(body.id ?? ""), String(body.item ?? ""));
 			case "send":
 				if (composer && typeof body.text === "string" && body.text.trim()) {
+					// submit the given text; a draft already in the composer stays there (TSP `send`)
+					const draft = composer.getText();
 					composer.setText(body.text);
 					composer.handleInput("\r");
+					if (draft.trim() && composer.getText() === "") composer.setText(draft);
+					scheduleRender(0);
 				}
 				return;
 			case "edit":
-				if (composer && typeof body.text === "string") {
-					const t = composer.getText();
-					const from = Math.max(0, Math.min(t.length, Number(body.from ?? 0)));
-					const to = Math.max(from, Math.min(t.length, Number(body.to ?? from)));
-					composer.setText(t.slice(0, from) + body.text + t.slice(to));
-					scheduleRender();
-				}
+				return applyEdit(String(body.id ?? ""), body);
+			case "undo":
+				return applyUndo(String(body.id ?? ""));
+			case "theme":
+				if (typeof body.dark === "boolean" && hello) hello.dark = body.dark;
 				return;
 			case "gone":
 				if (Array.isArray(body.ids) && body.ids.includes(sf)) openSurface();
@@ -421,7 +437,122 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const runAction = (act: string, target = "") => {
+	/** Put the composer's caret at a UTF-16 offset into its text. */
+	const setComposerCursor = (ed: TernComposer, offset: number) => {
+		const lines = ed.getLines();
+		const st = ed as unknown as { state: { cursorLine: number }; setCursorCol(col: number): void };
+		let rest = Math.max(0, offset);
+		for (let i = 0; i < lines.length; i++) {
+			const len = lines[i]!.length;
+			if (rest <= len || i === lines.length - 1) {
+				st.state.cursorLine = i;
+				st.setCursorCol(Math.min(rest, len));
+				return;
+			}
+			rest -= len + 1;
+		}
+	};
+
+	type DialogField = { getValue(): string; setValue(v: string): void; cursor: number; pushUndo?(): void; undo?(): void };
+	const dialogField = (id: string): DialogField | undefined =>
+		id === DIALOG_INPUT ? (shownInput() as unknown as { input?: DialogField } | undefined)?.input : undefined;
+
+	/**
+	 * A TSP `edit`: Tern replaced `[from, to)` of an editor or input with `text` (a selection paste,
+	 * IME, drag and drop) and put the caret at `cursor`. `len` is the length Tern saw; when it
+	 * differs the edit is stale and dropped, and the next frame shows the real text again.
+	 */
+	const applyEdit = (id: string, e: { from?: unknown; to?: unknown; text?: unknown; cursor?: unknown; len?: unknown }) => {
+		if (typeof e.text !== "string") return;
+		const field = dialogField(id);
+		if (!field && !composer) return;
+		const before = field ? field.getValue() : composer!.getText();
+		if (typeof e.len === "number" && e.len !== before.length) return scheduleRender(0);
+		const clamp = (v: unknown, max: number, dflt: number) => Math.max(0, Math.min(max, typeof v === "number" && Number.isFinite(v) ? v : dflt));
+		const from = clamp(e.from, before.length, 0);
+		const to = Math.max(from, clamp(e.to, before.length, from));
+		const text = field ? e.text.replace(/[\r\n]+/g, "") : e.text;
+		const after = before.slice(0, from) + text + before.slice(to);
+		const caret = clamp(e.cursor, after.length, from + text.length);
+		if (field) {
+			field.pushUndo?.();
+			field.setValue(after);
+			field.cursor = caret;
+		} else {
+			composer!.setText(after); // one undo unit, as typing is
+			setComposerCursor(composer!, caret);
+		}
+		tuiRef?.requestRender();
+		scheduleRender(0);
+	};
+
+	/** A TSP `undo` (Ctrl+Z in a Tern field): pi's own undo history for that field. */
+	const applyUndo = (id: string) => {
+		const field = dialogField(id);
+		if (field) field.undo?.();
+		else (composer as unknown as { undo?: () => void } | undefined)?.undo?.();
+		tuiRef?.requestRender();
+		scheduleRender(0);
+	};
+
+	/** Pointer picks: rows of the select sheet and of the autocomplete list. */
+	const pick = (activate: boolean, id: string, item: string) => {
+		if (id === SHEET_ID) {
+			currentSheet()?.pick(activate, item); // picker items carry pi's own ids (model ids hold a "/")
+			tuiRef?.requestRender();
+			return scheduleRender(0);
+		}
+		const key = item.slice(Math.max(item.lastIndexOf("/"), item.lastIndexOf(".")) + 1);
+		if (id === SELECT_ID || id.startsWith(`${SELECT_ID}.`) || id.startsWith(`${SELECT_ID}/`)) {
+			const sel = shownSelector() as unknown as
+				| { options: string[]; selectedIndex: number; updateList(): void; onSelectCallback(o: string): void }
+				| undefined;
+			const index = Number(key);
+			if (!sel || !Number.isInteger(index) || index < 0 || index >= sel.options.length) return;
+			sel.selectedIndex = index;
+			sel.updateList();
+			if (activate) sel.onSelectCallback(sel.options[index]!);
+		} else if (id.startsWith("complete")) {
+			const index = autocompleteKeys.get(key);
+			const list = (composer as unknown as { autocompleteList?: { setSelectedIndex(i: number): void } } | undefined)?.autocompleteList;
+			if (index === undefined || !list) return;
+			list.setSelectedIndex(index);
+			if (activate) composer!.handleInput("\t"); // apply the completion without submitting
+		} else return;
+		tuiRef?.requestRender();
+		scheduleRender(0);
+	};
+
+	const runAction = (act: string, target = "", value?: string) => {
+		if (target === SHEET_ID) {
+			currentSheet()?.act(act, value);
+			tuiRef?.requestRender();
+			return scheduleRender(0);
+		}
+		if (target === SELECT_ID || target.startsWith(`${SELECT_ID}.`) || target.startsWith(`${SELECT_ID}/`)) {
+			const sel = shownSelector() as unknown as
+				| { options: string[]; selectedIndex: number; onSelectCallback(o: string): void; onCancelCallback(): void }
+				| undefined;
+			if (!sel) return;
+			if (act === "confirm") {
+				const option = sel.options[sel.selectedIndex];
+				if (option !== undefined) sel.onSelectCallback(option);
+			} else if (act === "close") sel.onCancelCallback();
+			tuiRef?.requestRender();
+			scheduleRender(0);
+			return;
+		}
+		if (act === "dialog.submit" || act === "dialog.cancel") {
+			const dlg = shownInput() as unknown as
+				| { input: { getValue(): string }; onSubmitCallback(v: string): void; onCancelCallback(): void }
+				| undefined;
+			if (!dlg) return;
+			if (act === "dialog.submit") dlg.onSubmitCallback(dlg.input.getValue());
+			else dlg.onCancelCallback();
+			tuiRef?.requestRender();
+			scheduleRender(0);
+			return;
+		}
 		if (act === "remove-image") {
 			const n = Number(/img(\d+)/.exec(target)?.[1]);
 			const image = composerImages.find((a) => a.n === n);
@@ -455,6 +586,9 @@ export default function (pi: ExtensionAPI) {
 				break;
 			case "usage.close":
 				usageOpen = false;
+				break;
+			case "queue.edit":
+				ed?.actionHandlers?.get("app.message.dequeue")?.();
 				break;
 			case "interrupt":
 				ctxRef?.abort();
@@ -634,7 +768,9 @@ export default function (pi: ExtensionAPI) {
 			reconciler.region("dock", dock.nodes, ops);
 			const overlay = autocompleteOverlay();
 			const card = usageCard();
-			reconciler.region("layer", [overlay, card].filter((x): x is TspNode => !!x), ops);
+			const selector = shownSelector();
+			const layer = [overlay, card, selector ? selectorPicker(selector) : null, currentSheet()?.node ?? null, ...overlayNodes()];
+			reconciler.region("layer", layer.filter((x): x is TspNode => !!x), ops);
 			if (dock.focus !== lastFocus) {
 				ops.push(["focus", dock.focus]);
 				lastFocus = dock.focus;
@@ -684,16 +820,16 @@ export default function (pi: ExtensionAPI) {
 	/** Tern's chat column is narrower than the pane: render fallbacks to fit it. */
 	const readerCols = () => Math.max(20, Math.min(cols - 4, 104));
 
-	const ansiNode = (comp: Component, idPrefix: string, role: string): TspNode | null => {
+	const ansiNode = (comp: Component, idPrefix: string, role: string, width = readerCols()): TspNode | null => {
 		let lines: string[];
 		try {
-			lines = trimBlank(comp.render(readerCols()));
+			lines = trimBlank(comp.render(width));
 		} catch {
 			return null;
 		}
 		if (lines.length === 0) return null;
 		lines = lines.map(trimRight);
-		const key = `${cols}\n${lines.join("\n")}`;
+		const key = `${width}\n${lines.join("\n")}`;
 		const cached = nodeCache.get(comp);
 		if (cached?.key === key) return cached.node;
 		const node = n("ansi", { role, text: lines.join("\n") }, undefined, idOf(comp, idPrefix));
@@ -749,10 +885,15 @@ export default function (pi: ExtensionAPI) {
 	const describeMain = (): TspNode[] => {
 		const out: TspNode[] = [n("spacer", { size: "sm" }, undefined, "top"), welcome()];
 		const chat = containers().chat;
+		const live = new Set<string>();
 		for (const comp of chat?.children ?? []) {
 			const node = describeChat(comp);
-			if (node) out.push(node);
+			if (!node) continue;
+			out.push(node);
+			if (node.id) live.add(node.id);
 		}
+		// copy texts of messages no longer shown (after /new, /resume, /tree) can go
+		if (copyTexts.size > live.size) for (const id of copyTexts.keys()) if (!live.has(id)) copyTexts.delete(id);
 		const now = Date.now();
 		toasts = toasts.filter((t) => t.until > now);
 		for (const t of toasts) out.push(n("toast", { text: t.text, ttl: 2400, role: "omp.toast.status" }, undefined, t.id));
@@ -774,6 +915,13 @@ export default function (pi: ExtensionAPI) {
 		if (comp instanceof AssistantMessageComponent) return assistantNode(comp);
 		if (comp instanceof ToolExecutionComponent) return toolNode(comp);
 		if (comp instanceof BashExecutionComponent) return userBashNode(comp);
+		if (comp instanceof CompactionSummaryMessageComponent) return summaryNode(comp, "compaction");
+		if (comp instanceof BranchSummaryMessageComponent) return summaryNode(comp, "branch");
+		if (comp instanceof SkillInvocationMessageComponent) return skillNode(comp);
+		if (comp instanceof CustomMessageComponent) {
+			const node = customNode(comp);
+			if (node) return node;
+		}
 		// Plain text and markdown travel unwrapped, so Tern wraps them to its own column.
 		if (comp instanceof Markdown) {
 			const raw = (comp as unknown as { text?: string }).text;
@@ -806,6 +954,76 @@ export default function (pi: ExtensionAPI) {
 			],
 			{ role: `omp.notice.${kind}`, tone: kind, gap: "sm", align: "start" },
 			id,
+		);
+	};
+
+	/**
+	 * History-collapse points as omp draws them: a slim collapsible divider ("Compacted · 142K
+	 * tokens before", "Branch summarized") whose body is the summary.
+	 */
+	const summaryNode = (comp: object, kind: "compaction" | "branch"): TspNode => {
+		const m = (comp as { message?: { summary?: string; tokensBefore?: number } }).message ?? {};
+		const summary = String(m.summary ?? "").trim();
+		const before = typeof m.tokensBefore === "number" ? m.tokensBefore : 0;
+		return memo(comp, `${kind}|${before}|${summary}`, () =>
+			n(
+				"section",
+				{
+					role: kind === "compaction" ? "omp.compaction" : "omp.branch",
+					head:
+						kind === "compaction"
+							? [span("Compacted", "muted"), ...(before > 0 ? [span(` \u00b7 ${fmtTokens(before)} tokens before`, "muted mono")] : [])]
+							: [span("Branch summarized", "muted")],
+					collapsible: true,
+					collapsed: true,
+				},
+				[
+					...(kind === "compaction"
+						? [spans([span("Summary of the earlier conversation", "dim")], { role: "omp.compaction.caption" }, "caption")]
+						: []),
+					md(summary || "(no summary)", {}, "summary"),
+				],
+				idOf(comp, kind === "compaction" ? "c" : "r"),
+			),
+		);
+	};
+
+	/** A skill invocation: collapsed "Skill <name>", the skill's instructions inside. */
+	const skillNode = (comp: SkillInvocationMessageComponent): TspNode => {
+		const b = (comp as unknown as { skillBlock?: { name?: string; location?: string; content?: string } }).skillBlock ?? {};
+		const name = String(b.name ?? "skill");
+		const content = String(b.content ?? "").trim();
+		return memo(comp, `${name}|${content}`, () =>
+			n(
+				"section",
+				{ role: "omp.skill", head: [span("Skill ", "muted"), span(name, "strong")], title: b.location, collapsible: true, collapsed: true },
+				content ? [md(content, {}, "body")] : [],
+				idOf(comp, "k"),
+			),
+		);
+	};
+
+	/**
+	 * An extension's message (`pi.sendMessage`) without a renderer of its own: its type as the head
+	 * and the text as markdown. Messages an extension renders itself stay its own rendering (null).
+	 */
+	const customNode = (comp: CustomMessageComponent): TspNode | null => {
+		const c = comp as unknown as { customComponent?: unknown; message?: { customType?: string; content?: unknown } };
+		if (c.customComponent || !c.message) return null;
+		const content = c.message.content;
+		const body = (
+			typeof content === "string"
+				? content
+				: Array.isArray(content)
+					? content
+							.filter((p: any) => p?.type === "text" && typeof p.text === "string")
+							.map((p: any) => p.text)
+							.join("\n")
+					: ""
+		).trim();
+		const type = String(c.message.customType ?? "message");
+		return memo(comp, `${type}|${body}`, () =>
+			n("card", { role: "omp.custom", head: [span(type, "strong")] }, body ? [md(body, {}, "body")] : [], idOf(comp, "x")),
 		);
 	};
 
@@ -1031,8 +1249,8 @@ export default function (pi: ExtensionAPI) {
 		const cached = nodeCache.get(comp);
 		if (done && cached?.key === `done:${cols}`) return cached.node;
 
-		const clockEntry = toolClock.get(c.toolCallId) ?? { start: Date.now() };
-		toolClock.set(c.toolCallId, clockEntry);
+		const clockEntry = toolClock.get(comp) ?? { start: Date.now() };
+		toolClock.set(comp, clockEntry);
 		if (done && clockEntry.end === undefined) clockEntry.end = Date.now();
 		const status = !done ? "running" : c.result!.isError ? "error" : "done";
 		const took = done ? (c.result!.durationMs ?? clockEntry.end! - clockEntry.start) : undefined;
@@ -1142,8 +1360,8 @@ export default function (pi: ExtensionAPI) {
 	const userBashNode = (comp: BashExecutionComponent): TspNode => {
 		const c = comp as unknown as { command: string; status?: string; exitCode?: number; getOutput(): string };
 		const status = c.status === "running" ? "running" : c.status === "complete" && (c.exitCode ?? 0) === 0 ? "done" : c.status === "running" ? "running" : "error";
-		const clockEntry = toolClock.get(idOf(comp, "b")) ?? { start: Date.now() };
-		toolClock.set(idOf(comp, "b"), clockEntry);
+		const clockEntry = toolClock.get(comp) ?? { start: Date.now() };
+		toolClock.set(comp, clockEntry);
 		if (status !== "running" && clockEntry.end === undefined) clockEntry.end = Date.now();
 		const took = status === "running" ? undefined : clockEntry.end! - clockEntry.start;
 		const output = stripAnsi(c.getOutput?.() ?? "").replace(/\s+$/, "");
@@ -1170,7 +1388,11 @@ export default function (pi: ExtensionAPI) {
 		const k = containers();
 		const nodes: TspNode[] = [];
 		const push = (node: TspNode | null) => node && nodes.push(node);
-		if (k.pending) push(ansiNode(k.pending, "p", "pi.pending"));
+		if (k.pending) {
+			const described = pendingNodes(k.pending);
+			if (described) nodes.push(...described);
+			else push(ansiNode(k.pending, "p", "pi.pending"));
+		}
 		if (running) nodes.push(hud());
 		else if (k.status) push(ansiNode(k.status, "s", "pi.status"));
 		if (k.above) push(ansiNode(k.above, "wa", "pi.widgets"));
@@ -1180,12 +1402,387 @@ export default function (pi: ExtensionAPI) {
 		if (composer && shown === composer) {
 			nodes.push(composerNode(composer));
 			focus = "composer.line/input";
+		} else if (shown instanceof ExtensionInputComponent) {
+			nodes.push(inputDialogNode(shown));
+			focus = DIALOG_INPUT;
+		} else if (shown instanceof ExtensionSelectorComponent || isSheet(shown)) {
+			// drawn as a picker sheet in the layer (selectorPicker, currentSheet); keys still reach it through the pty
 		} else if (shown) {
 			// a selector, dialog or custom component replaced the editor: keys go to it through the pty
 			push(ansiNode(shown, "d", "pi.dialog"));
 		}
 		if (k.below) push(ansiNode(k.below, "wb", "pi.widgets"));
+		// an extension overlay holding the keyboard: the composer must not look focused under it
+		if (focusedOverlay()) focus = null;
 		return { nodes, focus };
+	};
+
+	/**
+	 * pi's pending area: `!` commands still running while the agent works, then the queued steering
+	 * and follow-up messages as text lines. Described natively when it holds only those (bash cards
+	 * and omp's queue pills); anything else and the area falls back to pi's own rendering (null).
+	 */
+	const pendingNodes = (pending: Component): TspNode[] | null => {
+		const kids = (pending as unknown as { children?: Component[] }).children ?? [];
+		const out: TspNode[] = [];
+		const queued: { kind: string; text: string }[] = [];
+		for (const kid of kids) {
+			if (kid instanceof Spacer) continue;
+			if (kid instanceof BashExecutionComponent) {
+				out.push(userBashNode(kid));
+				continue;
+			}
+			const raw = (kid as unknown as { text?: unknown }).text;
+			if (typeof raw !== "string") return null;
+			const line = stripAnsi(raw);
+			const m = /^\s*(Steering|Follow-up): ([\s\S]*)$/.exec(line);
+			if (m) queued.push({ kind: m[1]!, text: m[2]! });
+			else if (!/to edit all queued messages\s*$/.test(line)) return null;
+		}
+		if (queued.length > 0) out.push(queueNode(queued));
+		return out;
+	};
+
+	const queueNode = (queued: { kind: string; text: string }[]): TspNode => {
+		const key = keybindingsRef?.getKeys("app.message.dequeue" as never)?.[0] as string | undefined;
+		const caps = key ? key.split("+").map((k) => (k === "escape" ? "esc" : k)) : [];
+		const count = queued.length;
+		return col(
+			queued.map((q, i) =>
+				row(
+					[
+						icon("corner-down-right", {}, "icon"),
+						text(q.text.replace(/\t/g, "    ").replace(/\s*\r?\n\s*/g, " \u21b5 "), { wrap: "none", truncate: "end", grow: 1, shrink: 1 }, "text"),
+						...(i === 0 && count > 1 ? [n("badge", { text: `${count} queued`, title: `${count} messages queued`, role: "omp.queue.count" }, undefined, "count")] : []),
+						row(
+							[...(caps.length > 0 ? [n("kbd", { keys: caps }, undefined, "key")] : []), text("Edit", {}, "label")],
+							{ role: "omp.queue.edit", gap: "xs", align: "center", title: key ? `Edit  ${key}` : "Edit", actions: { click: "queue.edit" } },
+							"edit",
+						),
+					],
+					{ role: "omp.queue.item", align: "center", gap: "sm", title: q.kind },
+					`${q.kind === "Steering" ? "steer" : "follow"}-${i}`,
+				),
+			),
+			{ role: "omp.queue", gap: "xs" },
+			"queue",
+		);
+	};
+
+	// ---------- describe: dialogs and overlays ----------
+
+	/** A dialog's title as plain text, split into its first line and the rest. */
+	const dialogTitle = (dlg: object): { title: string; detail: string } => {
+		const d = dlg as { titleText?: { text?: string }; baseTitle?: string; listContainer?: object; input?: object; children?: Component[] };
+		const [title = "", ...rest] = stripAnsi(d.titleText?.text ?? d.baseTitle ?? "").trim().split(/\r?\n/);
+		// the optional description is a Text between the title and the list (or the input field)
+		const kids = d.children ?? [];
+		const from = kids.indexOf(d.titleText as Component);
+		const to = kids.indexOf((d.listContainer ?? d.input) as Component);
+		const description =
+			from >= 0 && to > from
+				? kids
+						.slice(from + 1, to)
+						.filter((c): c is Text => c instanceof Text)
+						.map((c) => stripAnsi((c as unknown as { text?: string }).text ?? "").trim())
+						.filter(Boolean)
+				: [];
+		return { title: title.trim(), detail: [...rest, ...description].join("\n").trim() };
+	};
+
+	/** `ctx.ui.select` / `ctx.ui.confirm` as Tern's picker sheet, the way omp draws its hook selector. */
+	const SELECT_ID = "select";
+	const selectorPicker = (sel: ExtensionSelectorComponent): TspNode => {
+		const s = sel as unknown as { options: string[]; selectedIndex: number };
+		const { title, detail } = dialogTitle(sel);
+		return n(
+			"picker",
+			{
+				role: "omp.overlay.hook-select",
+				title,
+				subtitle: detail || undefined,
+				noun: "options",
+				size: "md",
+				layout: "rows",
+				preview: "none",
+				query: null,
+				items: s.options.map((label, i) => ({ id: String(i), label })),
+				selected: String(s.selectedIndex),
+				total: s.options.length,
+				actions: [
+					{ id: "confirm", label: "Select", keys: ["enter"], primary: true },
+					{ id: "close", label: "Cancel", keys: ["esc"], end: true },
+				],
+			},
+			undefined,
+			SELECT_ID,
+		);
+	};
+	/**
+	 * pi's own selectors (`/model`, `/thinking`, theme, …) as Tern picker sheets: whichever one sits
+	 * in the editor slot is described as one `picker` in the layer, with handlers for its pointer
+	 * events. Keys still reach the selector through the pty, so search and arrows work as in pi.
+	 */
+	type Sheet = { node: TspNode; pick(activate: boolean, item: string): void; act(act: string, value?: string): void };
+	const SHEET_ID = "sheet";
+	const CONFIRM_ACTION = { id: "confirm", label: "Select", keys: ["enter"], primary: true };
+	const CLOSE_ACTION = { id: "close", label: "Close", keys: ["esc"], end: true };
+	const keyCaps = (binding: string): string[] | undefined => {
+		const key = keybindingsRef?.getKeys(binding as never)?.[0] as string | undefined;
+		return key ? key.split("+").map((k) => (k === "escape" ? "esc" : k)) : undefined;
+	};
+	const selectListOf = (comp: unknown): SelectList | undefined => {
+		const list = (comp as { selectList?: unknown } | undefined)?.selectList;
+		return list instanceof SelectList ? list : undefined;
+	};
+	const isSheet = (comp: unknown) => comp instanceof ModelSelectorComponent || !!selectListOf(comp);
+	const currentSheet = (): Sheet | undefined => {
+		const shown = containers().editor?.children?.[0];
+		if (shown instanceof ModelSelectorComponent) return modelSheet(shown);
+		const list = selectListOf(shown);
+		return list ? selectListSheet(shown!, list) : undefined;
+	};
+	/** The search field of a selector that has one, as the picker's query and caret. */
+	const sheetQuery = (comp: unknown) => {
+		const input = (comp as { searchInput?: { getValue(): string; cursor?: number } }).searchInput;
+		return input ? { query: input.getValue(), cursor: input.cursor } : { query: null };
+	};
+
+	const modelSheet = (sel: ModelSelectorComponent): Sheet => {
+		type Item = { provider: string; id: string; model: { provider: string; id: string; name?: string } };
+		const s = sel as unknown as {
+			activeModels: Item[];
+			filteredModels: Item[];
+			allModels: Item[];
+			scopedModelItems: Item[];
+			selectedIndex: number;
+			scope: "all" | "scoped";
+			currentModel?: { provider: string; id: string };
+			defaultModel?: { provider: string; id: string };
+			errorMessage?: string;
+			refreshStatusMessage?: string;
+			updateList(): void;
+			setScope(scope: string): void;
+			handleSelect(model: unknown): void;
+			dispose(): void;
+			onCancelCallback(): void;
+			onSelectAsDefaultCallback?: (model: unknown) => void;
+		};
+		const key = (m: { provider: string; id: string }) => `${m.provider}/${m.id}`;
+		const filtered = s.filteredModels ?? [];
+		const selected = filtered[s.selectedIndex];
+		const defaultKey = s.defaultModel ? key(s.defaultModel) : undefined;
+		const saveKeys = keyCaps("app.models.save");
+		const node = n(
+			"picker",
+			{
+				role: "omp.overlay.model-picker",
+				title: "Models",
+				icon: "model",
+				noun: "models",
+				size: "md",
+				layout: "rows",
+				preview: "none",
+				...sheetQuery(sel),
+				items: (s.activeModels ?? []).map((it) => ({
+					id: key(it),
+					label: it.id,
+					mono: true,
+					detail: it.model?.name && it.model.name !== it.id ? `${it.model.name} \u00b7 ${it.provider}` : it.provider,
+					mark: { text: it.provider, icon: `provider:${it.provider}` },
+					...(key(it) === defaultKey ? { badges: [{ text: "default" }] } : {}),
+				})),
+				order: filtered.map(key),
+				selected: selected ? key(selected) : null,
+				current: s.currentModel ? [key(s.currentModel)] : [],
+				total: (s.activeModels ?? []).length,
+				...(s.scopedModelItems?.length
+					? {
+							tabs: [
+								{ id: "all", label: "All", count: s.allModels.length },
+								{ id: "scoped", label: "Scoped", count: s.scopedModelItems.length },
+							],
+							tab: s.scope,
+						}
+					: {}),
+				state: s.errorMessage ? "error" : "ready",
+				message: s.errorMessage || s.refreshStatusMessage || undefined,
+				empty: "No matching models",
+				actions: [
+					CONFIRM_ACTION,
+					...(s.onSelectAsDefaultCallback ? [{ id: "default", label: "Set as default", ...(saveKeys ? { keys: saveKeys } : {}) }] : []),
+					CLOSE_ACTION,
+				],
+			},
+			undefined,
+			SHEET_ID,
+		);
+		const chosen = () => s.filteredModels[s.selectedIndex];
+		return {
+			node,
+			pick(activate, item) {
+				const index = s.filteredModels.findIndex((it) => key(it) === item);
+				if (index < 0) return;
+				s.selectedIndex = index;
+				s.updateList();
+				if (activate) s.handleSelect(s.filteredModels[index]!.model);
+			},
+			act(act, value) {
+				const it = chosen();
+				if (act === "confirm" && it) s.handleSelect(it.model);
+				else if (act === "default" && it && s.onSelectAsDefaultCallback) {
+					s.dispose();
+					s.onSelectAsDefaultCallback(it.model);
+				} else if (act === "close") {
+					s.dispose();
+					s.onCancelCallback();
+				} else if ((value === "all" || value === "scoped") && s.scopedModelItems?.length) s.setScope(value);
+			},
+		};
+	};
+
+	/** Any selector built on pi-tui's SelectList (thinking level, theme, …): its texts above the list head the sheet. */
+	const selectListSheet = (comp: Component, list: SelectList): Sheet => {
+		type Item = { value: string; label?: string; description?: string };
+		const l = list as unknown as { filteredItems: Item[]; selectedIndex: number; onSelect?: (i: Item) => void; onCancel?: () => void; onSelectionChange?: (i: Item) => void };
+		const kids = (comp as unknown as { children?: Component[] }).children ?? [];
+		const before = kids.slice(0, Math.max(0, kids.indexOf(list as unknown as Component)));
+		const texts = before
+			.filter((c): c is Text => c instanceof Text)
+			.map((c) => stripAnsi((c as unknown as { text?: string }).text ?? "").trim())
+			.filter(Boolean);
+		const items = l.filteredItems ?? [];
+		const current: string[] = [];
+		const node = n(
+			"picker",
+			{
+				role: "omp.overlay.select",
+				title: texts[0] ?? "Select",
+				subtitle: texts.slice(1).join("\n") || undefined,
+				noun: "options",
+				size: "md",
+				layout: "rows",
+				preview: "none",
+				...sheetQuery(comp),
+				items: items.map((it) => {
+					const raw = stripAnsi(it.label ?? it.value);
+					if (/^\s*\u2713/.test(raw)) current.push(it.value);
+					return { id: it.value, label: raw.replace(/^[\s\u2713]+/, "") || it.value, ...(it.description ? { detail: stripAnsi(it.description) } : {}) };
+				}),
+				selected: items[l.selectedIndex]?.value ?? null,
+				current,
+				empty: "No matching options",
+				actions: [CONFIRM_ACTION, CLOSE_ACTION],
+			},
+			undefined,
+			SHEET_ID,
+		);
+		return {
+			node,
+			pick(activate, item) {
+				const index = l.filteredItems.findIndex((it) => it.value === item);
+				if (index < 0) return;
+				list.setSelectedIndex(index);
+				l.onSelectionChange?.(l.filteredItems[index]!);
+				if (activate) l.onSelect?.(l.filteredItems[index]!);
+			},
+			act(act) {
+				const it = l.filteredItems[l.selectedIndex];
+				if (act === "confirm" && it) l.onSelect?.(it);
+				else if (act === "close") l.onCancel?.();
+			},
+		};
+	};
+
+	const shownSelector = (): ExtensionSelectorComponent | undefined => {
+		const shown = containers().editor?.children?.[0];
+		return shown instanceof ExtensionSelectorComponent ? shown : undefined;
+	};
+
+	/** `ctx.ui.input` in the composer's place: title, the field, Cancel and Submit (omp's hook input). */
+	const DIALOG_INPUT = "dialog.field/input";
+	const inputDialogNode = (dlg: ExtensionInputComponent): TspNode => {
+		const field = (dlg as unknown as { input: { getValue(): string; cursor?: number } }).input;
+		const value = field.getValue();
+		const { title, detail } = dialogTitle(dlg);
+		return col(
+			[
+				col(
+					[
+						spans([span(title)], { wrap: "word", role: "omp.hook-input.title" }, "title"),
+						...(detail ? [spans([span(detail)], { wrap: "word", role: "omp.hook-input.detail" }, "detail")] : []),
+					],
+					{ role: "omp.hook-input.head", gap: "xs" },
+					"head",
+				),
+				col(
+					[n("input", { text: value, cursor: Math.min(value.length, field.cursor ?? value.length), sendable: false }, undefined, "input")],
+					{ role: "omp.hook-input.field" },
+					"field",
+				),
+				row(
+					[
+						n("spacer", { grow: 1 }, undefined, "fill"),
+						n("button", { role: "omp.btn", text: "Cancel", keys: ["esc"], title: "Cancel  esc", actions: { click: "dialog.cancel" } }, undefined, "cancel"),
+						n(
+							"button",
+							{ role: "omp.btn", text: "Submit", keys: ["enter"], variant: "primary", tone: "accent", title: "Submit  \u23ce", actions: { click: "dialog.submit" } },
+							undefined,
+							"submit",
+						),
+					],
+					{ role: "omp.actions", gap: "sm", align: "center" },
+					"actions",
+				),
+			],
+			{ role: "omp.overlay.hook-input" },
+			"dialog",
+		);
+	};
+	const shownInput = (): ExtensionInputComponent | undefined => {
+		const shown = containers().editor?.children?.[0];
+		return shown instanceof ExtensionInputComponent ? shown : undefined;
+	};
+
+	/**
+	 * Overlays extensions open with `ctx.ui.custom(..., { overlay: true })` live in pi-tui's overlay
+	 * stack, not in its children: each visible one becomes an `overlay` node in the layer, its
+	 * content rendered by the component itself at the width it asked for.
+	 */
+	type OverlayEntry = { component: Component; options?: { width?: number | string; minWidth?: number; anchor?: string; nonCapturing?: boolean }; hidden?: boolean };
+	const visibleOverlays = (): OverlayEntry[] => {
+		const t = tuiRef as unknown as { overlayStack?: OverlayEntry[]; isOverlayVisible?: (e: OverlayEntry) => boolean } | undefined;
+		return (t?.overlayStack ?? []).filter((e) => {
+			try {
+				return t?.isOverlayVisible ? t.isOverlayVisible(e) : !e.hidden;
+			} catch {
+				return !e.hidden;
+			}
+		});
+	};
+	const focusedOverlay = (): OverlayEntry | undefined => {
+		const focused = (tuiRef as unknown as { focusedComponent?: Component | null } | undefined)?.focusedComponent;
+		return focused ? visibleOverlays().find((e) => e.component === focused) : undefined;
+	};
+	const overlayNodes = (): TspNode[] => {
+		const focused = focusedOverlay();
+		const out: TspNode[] = [];
+		for (const entry of visibleOverlays()) {
+			const o = entry.options ?? {};
+			const room = Math.max(20, cols - 6);
+			let width = typeof o.width === "number" ? o.width : typeof o.width === "string" && o.width.endsWith("%") ? Math.floor((cols * Number.parseFloat(o.width)) / 100) : Math.min(80, room);
+			if (!Number.isFinite(width)) width = Math.min(80, room);
+			if (o.minWidth) width = Math.max(width, o.minWidth);
+			width = Math.max(20, Math.min(room, width));
+			const fraction = width / Math.max(1, cols);
+			const size = fraction >= 0.75 ? "lg" : fraction >= 0.45 ? "md" : "sm";
+			const anchor = o.anchor?.startsWith("top") ? "top" : o.anchor?.startsWith("bottom") ? "bottom" : "center";
+			const body = ansiNode(entry.component, "ov", "pi.overlay", width);
+			if (!body) continue;
+			const id = `ov-${idOf(entry.component, "o")}`;
+			out.push(n("overlay", { anchor, size, modal: entry === focused, role: "pi.overlay" }, [body], id));
+		}
+		return out;
 	};
 
 	let hudNode: TspNode | undefined;
@@ -1280,6 +1877,9 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
+	/** Autocomplete row key → index into pi's filtered items, for pointer picks. */
+	let autocompleteKeys = new Map<string, number>();
+
 	/** pi's autocomplete as omp's native picker: a `list` overlay in the layer, anchored at the caret. */
 	const autocompleteOverlay = (): TspNode | null => {
 		const ed = composer;
@@ -1296,12 +1896,15 @@ export default function (pi: ExtensionAPI) {
 		const shown = items.slice(first, first + 10);
 		const keyFor = new Map<object, string>();
 		const seen = new Map<string, number>();
-		for (const it of items) {
+		autocompleteKeys = new Map();
+		items.forEach((it, index) => {
 			const base = it.value.replace(/[\s/.]+/g, "_") || "_";
 			const count = seen.get(base) ?? 0;
 			seen.set(base, count + 1);
-			keyFor.set(it, count === 0 ? base : `${base}~${count}`);
-		}
+			const key = count === 0 ? base : `${base}~${count}`;
+			keyFor.set(it, key);
+			autocompleteKeys.set(key, index);
+		});
 		const prefix = (st.autocompletePrefix ?? "").replace(/^[/@]/, "").toLowerCase();
 		const label = (text: string) => {
 			const m = prefix && text.toLowerCase().startsWith(prefix) ? prefix.length : 0;
@@ -1567,6 +2170,9 @@ export default function (pi: ExtensionAPI) {
 		bar.push(n("status", { role: "omp.composer.extras", transparent: true, grow: 1 }, facts, "extras"));
 
 		const u = sessionUsage();
+		if (running && rate.shown !== undefined) {
+			bar.push(n("rate", { value: rate.shown, unit: "tok/s", role: "omp.composer.rate", title: "Generation rate" }, undefined, "rate"));
+		}
 		const costTitle = [
 			`Session cost  ${u.cost > 0 ? money(u.cost) : "\u2014"}${u.sub ? " (subscription)" : ""}`,
 			`Tokens  ${fmtTokens(u.input)} in \u00b7 ${fmtTokens(u.output)} out`,
@@ -1593,6 +2199,44 @@ export default function (pi: ExtensionAPI) {
 		kids.push(row(bar, { role: "omp.composer.bar", gap: "sm", align: "center" }, "bar"));
 
 		return col(kids, { role: shell ? "omp.editor.bash" : "omp.editor", tone: running ? "pending" : undefined }, "composer");
+	};
+
+	// ---------- generation rate ----------
+
+	/**
+	 * omp's tok/s chip. Per assistant message: output tokens over the time since its first streamed
+	 * token. While streaming the count is estimated from the text (4 characters a token); once the
+	 * provider reports `usage.output` that number is used. Shown only while pi works, and changed at
+	 * most twice a second so the chip reads calmly.
+	 */
+	let rate: { shown?: number; at: number; msg?: unknown; first?: number } = { at: 0 };
+	const RATE_MIN_MS = 1000;
+	const RATE_MIN_TOKENS = 16;
+	const trackRate = (m: any, ended: boolean) => {
+		if (m?.role !== "assistant") return;
+		const now = Date.now();
+		// updates carry snapshots, not the same object: the start time identifies the message
+		const key = m.timestamp ?? m;
+		if (rate.msg !== key) rate = { ...rate, msg: key, first: undefined };
+		let chars = 0;
+		for (const b of m.content ?? []) {
+			if (typeof b?.text === "string") chars += b.text.length;
+			else if (typeof b?.thinking === "string") chars += b.thinking.length;
+			else if (b?.type === "toolCall" && b.arguments) chars += JSON.stringify(b.arguments).length;
+		}
+		if (chars === 0) return;
+		rate.first ??= now;
+		const reported = typeof m.usage?.output === "number" && m.usage.output > 0 && (ended || m.stopReason) ? m.usage.output : undefined;
+		const tokens = reported ?? chars / 4;
+		const ms = now - rate.first;
+		if (ms < RATE_MIN_MS || tokens < RATE_MIN_TOKENS) return;
+		if (!ended && now - rate.at < 500) return;
+		const value = Math.round((tokens * 1000) / ms);
+		if (value !== rate.shown) {
+			rate.shown = value;
+			rate.at = now;
+			scheduleRender();
+		}
 	};
 
 	// ---------- git ----------
@@ -1743,18 +2387,25 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_start", () => {
 		runStats = { start: Date.now(), input: 0, output: 0, cost: 0 };
 		running = true;
+		rate = { shown: undefined, at: 0 };
 		scheduleRender();
 	});
+	pi.on("message_update", (event) => trackRate((event as { message?: any }).message, false));
+	pi.on("message_end", (event) => trackRate((event as { message?: any }).message, true));
 	pi.on("agent_end", () => {
 		running = false;
+		rate = { shown: undefined, at: 0 };
 		tipIndex = (tipIndex + 1) % TIPS.length;
 		scheduleGit();
 		scheduleRender();
 	});
 	pi.on("tool_execution_end", () => scheduleGit());
-	for (const ev of ["model_select", "thinking_level_select", "message_update", "message_end", "turn_end"] as const) {
-		pi.on(ev, () => scheduleRender());
-	}
+	const rerender = () => scheduleRender();
+	pi.on("model_select", rerender);
+	pi.on("thinking_level_select", rerender);
+	pi.on("message_update", rerender);
+	pi.on("message_end", rerender);
+	pi.on("turn_end", rerender);
 
 	pi.registerCommand("tern-native", {
 		description: "Native Tern surface: status",

@@ -14,16 +14,20 @@ Outside Tern, or in a normal shell block, pi is untouched.
 | Area | In Tern |
 |---|---|
 | Start screen | pi's pixel logo in coral, blue and yellow, with Tern's intro animation, a dotted background, a rotating tip and the composer centred with a glow in pi's colours |
-| Composer | Native editor with a "Message pi" placeholder (or the session name), context meter with omp's warning thresholds (hover for tokens used and when auto-compaction starts), model chip (click to switch), thinking-effort chip (click to cycle), git branch with change counts, other extensions' statuses, session cost, and Send, which turns into Stop while pi works |
+| Composer | Native editor with a "Message pi" placeholder (or the session name), context meter with omp's warning thresholds (hover for tokens used and when auto-compaction starts), model chip (click to switch), thinking-effort chip (click to cycle), git branch with change counts, other extensions' statuses, the generation rate (tok/s) while pi works, session cost, and Send, which turns into Stop while pi works. Edits Tern makes itself (typing over a selection, IME, drag and drop) keep the caret where Tern put it, and Ctrl+Z in Tern goes through pi's undo |
 | Usage | The bar keeps only the cost. Hovering it shows the session's numbers the way pi's footer counts them (tokens in and out, prompt cache read and written, cache hit rate); clicking it opens a usage card with the full breakdown, billing and context, closed with Escape. On a subscription login the cost is dimmed, since it is an estimate at API prices. A "cache 41%" warning chip appears only when the cache hit rate of the last request drops below 80% |
-| Slash and `@` completion | Tern's native picker anchored at the caret, with the typed prefix highlighted |
+| Slash and `@` completion | Tern's native picker anchored at the caret, with the typed prefix highlighted; click a row to select it, double-click to complete |
+| Queue | Steering and follow-up messages queued while pi works show as omp's pills above the composer, with a count and an Edit button that puts them back in the editor |
 | Working indicator | Spinner, elapsed time and "Working…" above the composer, with a Stop button |
 | User messages | Right-aligned bubbles with a copy button, the send time, and "Copy message" on long-press |
 | Images | Pasted images (pi saves them to a temp file and puts its path in your message) become chips above the text, with a thumbnail, the pixel size and a remove button. The long path is hidden in the editor and taken out of the sent bubble, which shows the image as a thumbnail instead (click to zoom). Images the model reads appear inside the Read card, capped in height. The model still receives exactly the same message. |
 | Answers | Native markdown, collapsible thinking sections ("Thought for 4s"), and a hover row with copy, turn duration, tokens and cost |
 | Tool cards | Bash (command, output and Done/Exit footer with timing), Read/Write (file preview with syntax highlighting), Edit (real diff), and a generic card for any other tool |
 | Notices | pi's warnings, errors and status lines as icon notices, without the terminal colour codes |
-| Everything else | Selectors (`/model`, `/settings`, `/resume`), extension dialogs and widgets are still shown, drawn by pi as an `ansi` block, and keep working with the keyboard |
+| History | Compactions and branch summaries as omp's slim dividers ("Compacted · 142K tokens before"), the summary inside; skill invocations as a collapsible "Skill name" row; extension messages without a renderer of their own as a card |
+| Pickers | `/model` (and the model chip) as Tern's model picker: provider marks, the current model checked, the default badged, all/scoped tabs, search typed into pi. `/thinking`, the theme selector and other list selectors as picker sheets |
+| Extension dialogs | `ctx.ui.select` and `ctx.ui.confirm` as picker sheets, `ctx.ui.input` as omp's input card with Cancel and Submit; rows and buttons work with the pointer as well as the keyboard. Extension overlays (`ctx.ui.custom(..., { overlay: true })`) float as Tern overlays |
+| Everything else | `/settings`, `/resume`, `/tree`, other custom dialogs and widgets are still shown, drawn by pi as an `ansi` block, and keep working with the keyboard |
 | Themes | Follows Tern's light and dark themes |
 
 ## Requirements
@@ -110,6 +114,7 @@ This extension does the same for pi, without patching pi:
 | `src/reconcile.ts` | Keyed tree diff into TSP operations, with identity caching |
 | `src/tsp.ts` | Wire format: encoding, chunking, the inbound APC/OSC 877 parser and node helpers |
 | `bin/` | Launchers that set `PI_TERN_NATIVE=1` and start pi |
+| `test/` | Unit tests, and the headless Tern harness with its mock model, fixture extension and isolated pi config |
 
 ## Debugging
 
@@ -121,6 +126,8 @@ set PI_TERN_NATIVE_LOG=C:\temp\pi-tern.jsonl
 
 Every frame sent, every Tern event received (except acks) and every render's duration is appended as one JSON
 line. Tern reports rejected operations as `{"ev":"error"}` events, which makes protocol mistakes visible.
+With `PI_TERN_NATIVE_LOG_VERBOSE=1` the log also gets acks and the raw terminal input (your keystrokes, so only
+turn it on while debugging).
 
 Tern's own headless harness is the quickest way to see the result without a window:
 
@@ -130,6 +137,28 @@ tern ctl --control 47811 agent-command '"C:/path/to/pi-tern-native.cmd"'
 tern ctl --control 47811 block agent
 tern ctl --control 47811 shot start      # writes shots/serve/start.png and a layout JSON
 ```
+
+## Development
+
+```bash
+npm install        # pi's packages as dev dependencies (types), TypeScript
+npm run check      # tsc --noEmit
+npm test           # unit tests: wire format, inbound parser, tree diff
+```
+
+`test/shot.sh` checks the real thing headlessly. It starts a mock model (`test/mock-llm.mjs`, an
+OpenAI-compatible server that streams a canned answer: no network, no cost), a `tern serve`, and an agent block
+running `test/dev-launch.cmd`. That launcher runs this checkout's `src/` with an isolated pi config (`test/agent`:
+the mock models, no credentials, a demo skill) and a fixture extension (`test/fixture-ext.ts`) whose commands open
+the dialogs: `/t-select`, `/t-confirm`, `/t-input`, `/t-overlay`, `/t-custom`. Arguments are `tern ctl` commands;
+ones starting with `!` run in the shell:
+
+```bash
+bash test/shot.sh 'type "/t-select"' 'key Tab' 'key Enter' '!sleep 1' 'shot select'
+```
+
+Screenshots and layouts land in `%TEMP%\pi-tern-shots\serve`, the frame log in `%TEMP%\pi-tern-dev.jsonl`.
+`wait N` only moves Tern's own clock forward and returns at once, so give pi real time with `!sleep N`.
 
 ## Performance
 
@@ -141,7 +170,8 @@ per keystroke.
 - **Relies on pi internals.** It reads fields of pi's own components (for example a message component's
   `lastMessage`) and the order of the containers in pi's interactive mode, so a pi update may need small fixes.
 - **Not yet ported from omp:** the "Pseudo" shell view in Bash cards; rewind, retry and fork in the long-press
-  menu; and omp's rate (tok/s) chip.
+  menu; and native `/settings`, `/resume` and `/tree` sheets (they are still pi's own drawing).
+- **Extension overlays** are pi's own rendering inside a Tern overlay, not native widgets.
 - **Images are recognised by path:** any absolute path to an existing `.png`, `.jpg`, `.gif`, `.webp` or `.bmp`
   file in a message is shown as an image (up to 20 MB). Paths to files that no longer exist stay as text.
 - **Not verified in a real window yet:** Windows IME input and the thinking display.
