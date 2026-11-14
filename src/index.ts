@@ -309,10 +309,16 @@ export default function (pi: ExtensionAPI) {
 		scheduleRender(0);
 	};
 
+	const sheetNodes = (): TspNode[] => {
+		const sheet = currentSheet();
+		return sheet ? [sheet.node, ...(sheet.sub ? [sheet.sub.node] : [])] : [];
+	};
+
 	/** Pointer picks: rows of the select sheet and of the autocomplete list. */
 	const pick = (activate: boolean, id: string, item: string) => {
-		if (id === SHEET_ID) {
-			currentSheet()?.pick(activate, item); // picker items carry pi's own ids (model ids hold a "/")
+		if (id === SHEET_ID || id === SUBSHEET_ID) {
+			const sheet = currentSheet();
+			(id === SHEET_ID ? sheet : sheet?.sub)?.pick(activate, item); // picker items carry pi's own ids (model ids hold a "/")
 			tuiRef?.requestRender();
 			return scheduleRender(0);
 		}
@@ -338,8 +344,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const runAction = (act: string, target = "", value?: string) => {
-		if (target === SHEET_ID) {
-			currentSheet()?.act(act, value);
+		if (target === SHEET_ID || target === SUBSHEET_ID) {
+			const sheet = currentSheet();
+			(target === SHEET_ID ? sheet : sheet?.sub)?.act(act, value);
 			tuiRef?.requestRender();
 			return scheduleRender(0);
 		}
@@ -634,7 +641,7 @@ export default function (pi: ExtensionAPI) {
 			const overlay = autocompleteOverlay();
 			const card = usageCard();
 			const selector = shownSelector();
-			const layer = [overlay, card, selector ? selectorPicker(selector) : null, currentSheet()?.node ?? null, ...overlayNodes()];
+			const layer = [overlay, card, selector ? selectorPicker(selector) : null, ...sheetNodes(), ...overlayNodes()];
 			reconciler.region("layer", layer.filter((x): x is TspNode => !!x), ops);
 			if (dock.focus !== lastFocus) {
 				ops.push(["focus", dock.focus]);
@@ -1552,7 +1559,10 @@ export default function (pi: ExtensionAPI) {
 		pick(activate: boolean, item: string): void;
 		act(act: string, value?: string): void;
 		change?(item: string, value: unknown): void;
+		/** A sheet opened over this one (a settings submenu with a list), drawn and routed as SUBSHEET_ID. */
+		sub?: Sheet;
 	};
+	const SUBSHEET_ID = "subsheet";
 	const SHEET_ID = "sheet";
 	const CONFIRM_ACTION = { id: "confirm", label: "Select", keys: ["enter"], primary: true };
 	const CLOSE_ACTION = { id: "close", label: "Close", keys: ["esc"], end: true };
@@ -1568,6 +1578,19 @@ export default function (pi: ExtensionAPI) {
 	const selectListOf = (comp: unknown): SelectList | undefined => {
 		const list = (comp as { selectList?: unknown } | undefined)?.selectList;
 		return list instanceof SelectList ? list : undefined;
+	};
+	/** The part of a submenu that holds a SelectList: itself, or its current input/step component. */
+	const selectHost = (comp: Component, depth = 0): Component | undefined => {
+		if (selectListOf(comp)) return comp;
+		if (depth > 3) return undefined;
+		const c = comp as unknown as { inputComponent?: Component; activeComponent?: Component };
+		for (const inner of [c.inputComponent, c.activeComponent]) {
+			if (inner && inner !== comp) {
+				const found = selectHost(inner, depth + 1);
+				if (found) return found;
+			}
+		}
+		return undefined;
 	};
 	const isSessionList = (comp: unknown): comp is SessionSelectorComponent =>
 		comp instanceof SessionSelectorComponent && (comp as unknown as { mode?: string }).mode !== "rename";
@@ -1958,7 +1981,11 @@ export default function (pi: ExtensionAPI) {
 			return { k: "action", label: stripAnsi(it.currentValue) || "Open", act: `open:${it.id}` };
 		};
 		const submenu = list.submenuComponent;
-		const editor = submenu ? ansiNode(submenu, "se", "pi.settings.submenu", Math.min(54, readerCols())) : null;
+		// a submenu built on a SelectList (theme, per-model thinking, …) is a native picker over the page;
+		// anything else is pi's own rendering placed on the page
+		const host = submenu ? selectHost(submenu) : undefined;
+		const sub = host ? selectListSheet(host, selectListOf(host)!, SUBSHEET_ID) : undefined;
+		const editor = submenu && !sub ? ansiNode(submenu, "se", "pi.settings.submenu", Math.min(54, readerCols())) : null;
 		const query = list.searchEnabled ? list.searchInput?.getValue() : undefined;
 		const node = n(
 			"prefs",
@@ -1993,6 +2020,7 @@ export default function (pi: ExtensionAPI) {
 		};
 		return {
 			node,
+			sub,
 			pick(activate, item) {
 				if (!shown.some((it) => it.id === item)) return;
 				if (activate) return open(item);
@@ -2019,7 +2047,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/** Any selector built on pi-tui's SelectList (thinking level, theme, …): its texts above the list head the sheet. */
-	const selectListSheet = (comp: Component, list: SelectList): Sheet => {
+	const selectListSheet = (comp: Component, list: SelectList, id = SHEET_ID): Sheet => {
 		type Item = { value: string; label?: string; description?: string };
 		const l = list as unknown as { filteredItems: Item[]; selectedIndex: number; onSelect?: (i: Item) => void; onCancel?: () => void; onSelectionChange?: (i: Item) => void };
 		const kids = (comp as unknown as { children?: Component[] }).children ?? [];
@@ -2052,7 +2080,7 @@ export default function (pi: ExtensionAPI) {
 				actions: [CONFIRM_ACTION, CLOSE_ACTION],
 			},
 			undefined,
-			SHEET_ID,
+			id,
 		);
 		return {
 			node,
