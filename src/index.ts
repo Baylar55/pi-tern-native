@@ -45,6 +45,9 @@ import {
 	VERSION,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, type EditorTheme, Markdown, SelectList, Spacer, type TUI, Text } from "@earendil-works/pi-tui";
+import { PI_LOGO, PI_STYLES, TIPS } from "./brand.ts";
+import { ago, ansiToSpans, clock, fmtTokens, homeShort, langOf, resultText, stripAnsi, trimBlank, trimRight } from "./format.ts";
+import { IMAGE_MIME, IMAGE_PATH, imageSize, MAX_IMAGE_BYTES } from "./images.ts";
 import { Reconciler } from "./reconcile.ts";
 import {
 	APC,
@@ -70,218 +73,14 @@ const PLACEHOLDER = "Message pi";
 const COST_ICON = "\u{f067a}";
 const OSC_ONLY = /^(\x1b\][^\x07\x1b]*(\x07|\x1b\\))+$/;
 
-const TIPS = [
-	"Start a message with ! to run a shell command, or !! to keep its output out of the context",
-	"Type / for commands and @ to attach files",
-	"Shift+Tab changes the thinking level, Ctrl+L switches the model",
-	"Escape stops the agent, Ctrl+P cycles through your models",
-	"Run /tree to go back to an earlier point in the session",
-]
-
-const LANG: Record<string, string> = {
-	ts: "typescript", tsx: "tsx", js: "javascript", jsx: "jsx", mjs: "javascript", cjs: "javascript",
-	java: "java", kt: "kotlin", py: "python", rb: "ruby", go: "go", rs: "rust", cs: "csharp",
-	c: "c", h: "c", cpp: "cpp", hpp: "cpp", json: "json", md: "markdown", sql: "sql", xml: "xml",
-	yaml: "yaml", yml: "yaml", toml: "toml", sh: "bash", bash: "bash", ps1: "powershell",
-	html: "html", css: "css", scss: "scss", gradle: "groovy", properties: "properties", lua: "lua",
-};
-
 type G = { __piTernNative?: { surfaces: number } };
 const shared = ((globalThis as G).__piTernNative ??= { surfaces: 0 });
-
-function langOf(path: unknown): string | undefined {
-	if (typeof path !== "string") return undefined;
-	const ext = path.split(/[\\/]/).pop()?.split(".").pop()?.toLowerCase();
-	return ext ? LANG[ext] : undefined;
-}
-
-function stripAnsi(s: string): string {
-	return s.replace(/\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b_[^\x1b]*\x1b\\/g, "");
-}
-
-function fmtTokens(v: number): string {
-	if (v >= 1_000_000) return `${+(v / 1_000_000).toFixed(1)}M`;
-	if (v >= 1_000) return `${+(v / 1_000).toFixed(v >= 10_000 ? 0 : 1)}K`;
-	return `${v}`;
-}
-
-function clock(ts: unknown): string | undefined {
-	const d = typeof ts === "number" || typeof ts === "string" ? new Date(ts) : undefined;
-	if (!d || Number.isNaN(d.getTime())) return undefined;
-	return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-}
-
-/**
- * pi's logo (components/pi-logo.ts): the 4x4 pixel "Pi" in coral, blue and yellow.
- *
- * Built like Tern's built-in omp mark so Tern inlines it and runs the same welcome intro:
- * `mark` shapes fade in, the `trace` outline draws itself first. Unlike omp's, the fills are
- * solid brand colours rather than a gradient Tern recolours to ink, so pi keeps its identity.
- * The trace uses currentColor, Tern's text colour, so it suits light and dark themes.
- */
-const PI_CORAL = "#e48a7a";
-const PI_BLUE = "#4f8eb3";
-const PI_YELLOW = "#eab65d";
-const PI_LOGO = (() => {
-	const coral = "M14 13h27v18h-9v-9h-18z";
-	const blue = "M14 22h9v9h9v9h-9v9h-9z";
-	const yellow = "M41 31h9v18h-9z";
-	const outline = "M14 13h27v18h-9v-9h-9v9h9v9h-9v9h-9z";
-	const svg = [
-		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="10 12 44 38" shape-rendering="crispEdges">`,
-		`<path class="mark" fill="${PI_CORAL}" d="${coral}"/>`,
-		`<path class="mark" fill="${PI_BLUE}" d="${blue}"/>`,
-		`<path class="mark" fill="${PI_YELLOW}" d="${yellow}"/>`,
-		`<path class="trace" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round" pathLength="1" d="${outline}${yellow}"/>`,
-		`</svg>`,
-	].join("\n");
-	const bytes = Buffer.from(svg, "utf8");
-	return { bytes, mime: "image/svg+xml", id: createHash("sha256").update(bytes).digest("hex") };
-})();
-
-/**
- * pi's palette for Tern's chat chrome, sent with the TSP `styles` feature (`s` verb). It
- * retints what Tern otherwise paints in omp's purple/pink/cyan: the aurora under the composer
- * and the haze behind the dotted start screen.
- */
-const PI_STYLES = `
-[data-role^='omp.editor'] {
-	--rd-aurora:
-		light-dark(#d9705f, ${PI_CORAL}), light-dark(#d39a35, ${PI_YELLOW}), light-dark(#3f7ea6, ${PI_BLUE}),
-		light-dark(#5f9cc4, #7fb3d4), light-dark(#d9705f, ${PI_CORAL});
-}
-[data-role='omp.composer.model'] .sf-t-accent {
-	color: light-dark(#3f7ea6, #7fb3d4) !important;
-}
-/* Tern's own folder chip: the git chip already says where pi works, and omp shows none */
-[data-role='omp.composer.bar'] > .sf-place {
-	display: none !important;
-}
-.sf-slot::before {
-	background-image:
-		radial-gradient(560px 110px at 50% 100%, rgb(228 138 122 / 9%), transparent),
-		radial-gradient(circle, var(--l4) 0 1px, transparent 1.5px) !important;
-}
-`;
-
-/**
- * Absolute paths to image files in message text: what pi inserts when you paste an image
- * (`%TEMP%\pi-clipboard-<uuid>.png`), or any image path typed or dropped in. Only paths that exist
- * on disk become attachments; anything else stays plain text.
- */
-const IMAGE_PATH = /(?:[A-Za-z]:[\\/]|\\\\|\/)[^\s"'<>|*?]*?\.(?:png|jpe?g|gif|webp|bmp)(?![\w.])/gi;
-const IMAGE_MIME: Record<string, string> = {
-	png: "image/png",
-	jpg: "image/jpeg",
-	jpeg: "image/jpeg",
-	gif: "image/gif",
-	webp: "image/webp",
-	bmp: "image/bmp",
-};
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-
-/** Pixel size from the file header (PNG, GIF, JPEG, WebP, BMP), for chip labels and layout hints. */
-function imageSize(b: Buffer): { w: number; h: number } | undefined {
-	try {
-		if (b.length > 24 && b.readUInt32BE(0) === 0x89504e47) return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) };
-		if (b.length > 10 && b.toString("ascii", 0, 3) === "GIF") return { w: b.readUInt16LE(6), h: b.readUInt16LE(8) };
-		if (b.length > 26 && b.toString("ascii", 0, 2) === "BM") return { w: b.readInt32LE(18), h: Math.abs(b.readInt32LE(22)) };
-		if (b.length > 30 && b.toString("ascii", 0, 4) === "RIFF" && b.toString("ascii", 8, 12) === "WEBP") {
-			const kind = b.toString("ascii", 12, 16);
-			if (kind === "VP8X") return { w: 1 + b.readUIntLE(24, 3), h: 1 + b.readUIntLE(27, 3) };
-			if (kind === "VP8 ") return { w: b.readUInt16LE(26) & 0x3fff, h: b.readUInt16LE(28) & 0x3fff };
-			if (kind === "VP8L") {
-				const bits = b.readUInt32LE(21);
-				return { w: (bits & 0x3fff) + 1, h: ((bits >> 14) & 0x3fff) + 1 };
-			}
-		}
-		if (b[0] === 0xff && b[1] === 0xd8) {
-			let o = 2;
-			while (o + 9 < b.length) {
-				if (b[o] !== 0xff) {
-					o++;
-					continue;
-				}
-				const marker = b[o + 1]!;
-				if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
-					return { h: b.readUInt16BE(o + 5), w: b.readUInt16BE(o + 7) };
-				}
-				o += 2 + b.readUInt16BE(o + 2);
-			}
-		}
-	} catch {
-		/* unreadable header */
-	}
-	return undefined;
-}
-
-/** Drop the trailing padding pi-tui adds to every line, keeping any closing SGR codes. */
-function trimRight(line: string): string {
-	return line.replace(/[ \t]+((?:\x1b\[[0-9;:]*m)*)$/, "$1");
-}
-
-function trimBlank(lines: string[]): string[] {
-	let a = 0;
-	let b = lines.length;
-	while (a < b && stripAnsi(lines[a]!).trim() === "") a++;
-	while (b > a && stripAnsi(lines[b - 1]!).trim() === "") b--;
-	return lines.slice(a, b);
-}
-
-function resultText(result: any): string {
-	if (!result?.content) return "";
-	return result.content
-		.filter((c: any) => c?.type === "text" && typeof c.text === "string")
-		.map((c: any) => c.text)
-		.join("\n")
-		.replace(/\s+$/, "");
-}
 
 const trace = (msg: string) => {
 	const p = process.env.PI_TERN_NATIVE_LOG;
 	if (p) try { appendFileSync(p, `${JSON.stringify({ t: Date.now(), trace: msg })}
 `); } catch {}
 };
-
-/**
- * pi colours notices with its theme; Tern wants semantic styles. Map each run's foreground to the
- * theme token that produced it (warning, error, success…) so Tern draws it in its own palette.
- */
-function ansiToSpans(text: string, styleOf: (sgr: string) => string | undefined): { t: string; s?: string }[] {
-	const out: { t: string; s?: string }[] = [];
-	let fg: string | undefined;
-	let bold = false;
-	let italic = false;
-	const re = /\x1b\[([0-9;:]*)m/g;
-	let last = 0;
-	const push = (t: string) => {
-		if (!t) return;
-		const s = [fg && styleOf(fg), bold ? "strong" : undefined, italic ? "em" : undefined].filter(Boolean).join(" ") || undefined;
-		const prev = out[out.length - 1];
-		if (prev && prev.s === s) prev.t += t;
-		else out.push(s ? { t, s } : { t });
-	};
-	for (let m = re.exec(text); m; m = re.exec(text)) {
-		push(stripAnsi(text.slice(last, m.index)));
-		last = re.lastIndex;
-		const params = m[1] === "" ? ["0"] : m[1]!.split(";");
-		for (let i = 0; i < params.length; i++) {
-			const p = params[i];
-			if (p === "0") (fg = undefined), (bold = false), (italic = false);
-			else if (p === "1") bold = true;
-			else if (p === "22") bold = false;
-			else if (p === "3") italic = true;
-			else if (p === "23") italic = false;
-			else if (p === "39") fg = undefined;
-			else if (p === "38") {
-				fg = params[i + 1] === "2" ? params.slice(i, i + 5).join(";") : params.slice(i, i + 3).join(";");
-				i += params[i + 1] === "2" ? 4 : 2;
-			} else if (/^(3[0-7]|9[0-7])$/.test(p ?? "")) fg = p;
-		}
-	}
-	push(stripAnsi(text.slice(last)));
-	return out;
-}
 
 export default function (pi: ExtensionAPI) {
 	trace(`factory native=${process.env.PI_TERN_NATIVE} term=${process.env.TERM_PROGRAM}`);
@@ -1747,26 +1546,6 @@ export default function (pi: ExtensionAPI) {
 				} else if ((value === "all" || value === "scoped") && s.scopedModelItems?.length) s.setScope(value);
 			},
 		};
-	};
-
-	/** "3h", "2d": how long ago, for picker columns (a fixed string, so the catalogue does not change every render). */
-	const ago = (at: unknown): string => {
-		const t = at instanceof Date ? at.getTime() : typeof at === "number" || typeof at === "string" ? new Date(at).getTime() : Number.NaN;
-		if (!Number.isFinite(t)) return "";
-		const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
-		if (s < 60) return "now";
-		const m = Math.floor(s / 60);
-		if (m < 60) return `${m}m`;
-		const h = Math.floor(m / 60);
-		if (h < 24) return `${h}h`;
-		const d = Math.floor(h / 24);
-		if (d < 30) return d < 7 ? `${d}d` : `${Math.floor(d / 7)}w`;
-		return d < 365 ? `${Math.floor(d / 30)}mo` : `${Math.floor(d / 365)}y`;
-	};
-	const homeShort = (p: unknown) => {
-		const home = process.env.USERPROFILE ?? process.env.HOME;
-		const s = String(p ?? "");
-		return home && s.toLowerCase().startsWith(home.toLowerCase()) ? `~${s.slice(home.length)}` : s;
 	};
 
 	/**

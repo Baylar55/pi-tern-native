@@ -54,6 +54,9 @@ Copy `src/` into your extensions folder:
 ```text
 ~/.pi/agent/extensions/tern-native/
 ├── index.ts
+├── brand.ts
+├── format.ts
+├── images.ts
 ├── reconcile.ts
 └── tsp.ts
 ```
@@ -111,7 +114,10 @@ This extension does the same for pi, without patching pi:
 
 | File | Role |
 |---|---|
-| `src/index.ts` | Activation, handshake, input events, describing pi's UI as TSP nodes, the stylesheet and logo |
+| `src/index.ts` | Activation, handshake, input events, describing pi's UI as TSP nodes, dialogs, pickers and turn actions |
+| `src/brand.ts` | pi's logo, palette stylesheet and start-screen tips |
+| `src/format.ts` | Pure text helpers: ANSI to styled spans, token and time formatting, languages by extension |
+| `src/images.ts` | Image paths in messages and pixel sizes from file headers |
 | `src/reconcile.ts` | Keyed tree diff into TSP operations, with identity caching |
 | `src/tsp.ts` | Wire format: encoding, chunking, the inbound APC/OSC 877 parser and node helpers |
 | `bin/` | Launchers that set `PI_TERN_NATIVE=1` and start pi |
@@ -144,7 +150,7 @@ tern ctl --control 47811 shot start      # writes shots/serve/start.png and a la
 ```bash
 npm install        # pi's packages as dev dependencies (types), TypeScript
 npm run check      # tsc --noEmit
-npm test           # unit tests: wire format, inbound parser, tree diff
+npm test           # unit tests: wire format, inbound parser, tree diff, text and image helpers
 ```
 
 `test/shot.sh` checks the real thing headlessly. It starts a mock model (`test/mock-llm.mjs`, an
