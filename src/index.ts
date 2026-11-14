@@ -35,6 +35,7 @@ import {
 	type KeybindingsManager,
 	ModelSelectorComponent,
 	SessionSelectorComponent,
+	TreeSelectorComponent,
 	type ReadonlyFooterDataProvider,
 	SkillInvocationMessageComponent,
 	ToolExecutionComponent,
@@ -1540,11 +1541,15 @@ export default function (pi: ExtensionAPI) {
 	};
 	const isSessionList = (comp: unknown): comp is SessionSelectorComponent =>
 		comp instanceof SessionSelectorComponent && (comp as unknown as { mode?: string }).mode !== "rename";
-	const isSheet = (comp: unknown) => comp instanceof ModelSelectorComponent || isSessionList(comp) || !!selectListOf(comp);
+	const isTreeList = (comp: unknown): comp is TreeSelectorComponent =>
+		comp instanceof TreeSelectorComponent && !(comp as unknown as { labelInput?: unknown }).labelInput;
+	const isSheet = (comp: unknown) =>
+		comp instanceof ModelSelectorComponent || isSessionList(comp) || isTreeList(comp) || !!selectListOf(comp);
 	const currentSheet = (): Sheet | undefined => {
 		const shown = containers().editor?.children?.[0];
 		if (shown instanceof ModelSelectorComponent) return modelSheet(shown);
 		if (isSessionList(shown)) return sessionSheet(shown);
+		if (isTreeList(shown)) return treeSheet(shown);
 		const list = selectListOf(shown);
 		return list ? selectListSheet(shown!, list) : undefined;
 	};
@@ -1792,6 +1797,116 @@ export default function (pi: ExtensionAPI) {
 		};
 	};
 
+	/**
+	 * `/tree` as a tree picker: every entry of the session with its indent, user / assistant / tool
+	 * rows told apart, the active path dotted, labels as badges, pi's filter modes as tabs, and Go
+	 * here, Label and Copy as actions. Typing still goes to pi, which searches the tree itself.
+	 */
+	const TREE_FILTERS = [
+		{ id: "default", label: "Default" },
+		{ id: "no-tools", label: "No tools" },
+		{ id: "user-only", label: "User" },
+		{ id: "labeled-only", label: "Labeled" },
+		{ id: "all", label: "All" },
+	];
+	const treeSheet = (sel: TreeSelectorComponent): Sheet => {
+		type Entry = { id: string; type: string; message?: { role?: string; toolName?: string } };
+		type Flat = { node: { entry: Entry; label?: string }; indent: number };
+		const t = (sel as unknown as { treeList: unknown }).treeList as {
+			filteredNodes: Flat[];
+			selectedIndex: number;
+			searchQuery: string;
+			filterMode: string;
+			multipleRoots: boolean;
+			currentLeafId?: string;
+			activePathIds: Set<string>;
+			foldedNodes: Set<string>;
+			getEntryDisplayText(node: Flat["node"], selected: boolean): string;
+			isFoldable(id: string): boolean;
+			applyFilter(): void;
+			copySelected(): void;
+			onSelect?: (id: string) => void;
+			onCancel?: () => void;
+			onLabelEdit?: (id: string, label?: string) => void;
+		};
+		const rows = t.filteredNodes ?? [];
+		const items = rows.map((flat) => {
+			const e = flat.node.entry;
+			const role = e.type === "message" ? e.message?.role : undefined;
+			const tool = role === "toolResult" || role === "bashExecution";
+			const kind = role === "user" ? "user" : role === "assistant" ? "assistant" : tool ? "tool" : "marker";
+			// a tool row's glyph comes from its omp role (omp.tool.bash, omp.tool.read, …)
+			const toolRole = role === "bashExecution" ? "omp.tool.bash" : role === "toolResult" ? `omp.tool.${e.message?.toolName ?? "tool"}` : undefined;
+			let label = "";
+			try {
+				label = stripAnsi(t.getEntryDisplayText(flat.node, false)).replace(/^(user|assistant): /, "");
+			} catch {
+				label = `[${e.type}]`;
+			}
+			return {
+				id: e.id,
+				label: label.trim() || `[${e.type}]`,
+				node: kind,
+				depth: t.multipleRoots ? Math.max(0, flat.indent - 1) : flat.indent,
+				...(toolRole ? { role: toolRole } : {}),
+				...(t.isFoldable(e.id) && !t.foldedNodes.has(e.id) ? { open: true } : {}),
+				...(t.activePathIds.has(e.id) ? { dot: "accent" } : {}),
+				...(flat.node.label ? { badges: [{ text: flat.node.label, tone: "warning" }] } : {}),
+				...(kind === "tool" || kind === "marker" ? { tone: "muted" } : {}),
+			};
+		});
+		const node = n(
+			"picker",
+			{
+				role: "omp.overlay.tree",
+				title: "Session tree",
+				icon: "branch",
+				noun: "entries",
+				size: "lg",
+				layout: "tree",
+				preview: "none",
+				query: t.searchQuery ?? "",
+				placeholder: "Search the session",
+				tabs: TREE_FILTERS,
+				tab: t.filterMode,
+				items,
+				selected: rows[t.selectedIndex]?.node.entry.id ?? null,
+				current: t.currentLeafId ? [t.currentLeafId] : [],
+				empty: "No entries",
+				actions: [
+					{ ...CONFIRM_ACTION, label: "Go here" },
+					{ id: "label", label: "Label", ...withKeys("app.tree.editLabel") },
+					{ id: "copy", label: "Copy", ...withKeys("app.message.copy") },
+					CLOSE_ACTION,
+				],
+			},
+			undefined,
+			SHEET_ID,
+		);
+		const selected = () => t.filteredNodes[t.selectedIndex]?.node;
+		return {
+			node,
+			pick(activate, item) {
+				const index = t.filteredNodes.findIndex((f) => f.node.entry.id === item);
+				if (index < 0) return;
+				t.selectedIndex = index;
+				if (activate) t.onSelect?.(item);
+			},
+			act(act, value) {
+				const s = selected();
+				if (act === "confirm" && s) t.onSelect?.(s.entry.id);
+				else if (act === "close") t.onCancel?.();
+				else if (act === "label" && s) t.onLabelEdit?.(s.entry.id, s.label);
+				else if (act === "copy") t.copySelected();
+				else if (value && TREE_FILTERS.some((f) => f.id === value)) {
+					t.filterMode = value;
+					t.foldedNodes.clear();
+					t.applyFilter();
+				}
+			},
+		};
+	};
+
 	/** Any selector built on pi-tui's SelectList (thinking level, theme, …): its texts above the list head the sheet. */
 	const selectListSheet = (comp: Component, list: SelectList): Sheet => {
 		type Item = { value: string; label?: string; description?: string };
@@ -1861,6 +1976,17 @@ export default function (pi: ExtensionAPI) {
 		if (shown instanceof ExtensionInputComponent) {
 			const d = shown as unknown as { input: DialogField; onSubmitCallback(v: string): void; onCancelCallback(): void };
 			return { ...dialogTitle(shown), field: d.input, submit: () => d.onSubmitCallback(d.input.getValue()), cancel: () => d.onCancelCallback() };
+		}
+		if (shown instanceof TreeSelectorComponent) {
+			const label = (shown as unknown as { labelInput?: { input: DialogField; handleInput(d: string): void } | null }).labelInput;
+			if (!label) return undefined;
+			return {
+				title: "Label entry",
+				detail: "An empty label removes it",
+				field: label.input,
+				submit: () => label.handleInput("\r"),
+				cancel: () => label.handleInput("\x1b"),
+			};
 		}
 		if (shown instanceof SessionSelectorComponent) {
 			const s = shown as unknown as { mode: string; renameInput: DialogField & { onSubmit?: (v: string) => void }; exitRenameMode(): void };

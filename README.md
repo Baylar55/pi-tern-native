@@ -25,9 +25,9 @@ Outside Tern, or in a normal shell block, pi is untouched.
 | Tool cards | Bash (command, output and Done/Exit footer with timing), Read/Write (file preview with syntax highlighting), Edit (real diff), and a generic card for any other tool |
 | Notices | pi's warnings, errors and status lines as icon notices, without the terminal colour codes |
 | History | Compactions and branch summaries as omp's slim dividers ("Compacted · 142K tokens before"), the summary inside; skill invocations as a collapsible "Skill name" row; extension messages without a renderer of their own as a card |
-| Pickers | `/model` (and the model chip) as Tern's model picker: provider marks, the current model checked, the default badged, all/scoped tabs, search typed into pi. `/resume` as the session picker: this folder / all tabs, the session tree, message count and age, search, sort, named-only, Rename (in a native input card) and Delete (with an inline confirmation). `/thinking`, the theme selector and other list selectors as picker sheets |
+| Pickers | `/model` (and the model chip) as Tern's model picker: provider marks, the current model checked, the default badged, all/scoped tabs, search typed into pi. `/resume` as the session picker: this folder / all tabs, the session tree, message count and age, search, sort, named-only, Rename (in a native input card) and Delete (with an inline confirmation). `/tree` as a tree picker: every entry indented, tool rows with their tool glyph, the active path dotted, labels as badges, the filter modes as tabs, Go here, Label (in a native input card) and Copy. `/thinking`, the theme selector and other list selectors as picker sheets |
 | Extension dialogs | `ctx.ui.select` and `ctx.ui.confirm` as picker sheets, `ctx.ui.input` as omp's input card with Cancel and Submit; rows and buttons work with the pointer as well as the keyboard. Extension overlays (`ctx.ui.custom(..., { overlay: true })`) float as Tern overlays |
-| Everything else | `/settings`, `/tree`, other custom dialogs and widgets are still shown, drawn by pi as an `ansi` block, and keep working with the keyboard |
+| Everything else | `/settings`, other custom dialogs and widgets are still shown, drawn by pi as an `ansi` block, and keep working with the keyboard |
 | Themes | Follows Tern's light and dark themes |
 
 ## Requirements
@@ -170,7 +170,7 @@ per keystroke.
 - **Relies on pi internals.** It reads fields of pi's own components (for example a message component's
   `lastMessage`) and the order of the containers in pi's interactive mode, so a pi update may need small fixes.
 - **Not yet ported from omp:** the "Pseudo" shell view in Bash cards; rewind, retry and fork in the long-press
-  menu; and native `/settings` and `/tree` sheets (they are still pi's own drawing).
+  menu; and a native `/settings` sheet (they are still pi's own drawing).
 - **Extension overlays** are pi's own rendering inside a Tern overlay, not native widgets.
 - **Images are recognised by path:** any absolute path to an existing `.png`, `.jpg`, `.gif`, `.webp` or `.bmp`
   file in a message is shown as an image (up to 20 MB). Paths to files that no longer exist stay as text.
