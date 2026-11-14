@@ -34,6 +34,7 @@ import {
 	ExtensionSelectorComponent,
 	type KeybindingsManager,
 	ModelSelectorComponent,
+	SessionSelectorComponent,
 	type ReadonlyFooterDataProvider,
 	SkillInvocationMessageComponent,
 	ToolExecutionComponent,
@@ -454,8 +455,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	type DialogField = { getValue(): string; setValue(v: string): void; cursor: number; pushUndo?(): void; undo?(): void };
-	const dialogField = (id: string): DialogField | undefined =>
-		id === DIALOG_INPUT ? (shownInput() as unknown as { input?: DialogField } | undefined)?.input : undefined;
+	const dialogField = (id: string): DialogField | undefined => (id === DIALOG_INPUT ? activeTextDialog()?.field : undefined);
 
 	/**
 	 * A TSP `edit`: Tern replaced `[from, to)` of an editor or input with `text` (a selection paste,
@@ -543,12 +543,10 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (act === "dialog.submit" || act === "dialog.cancel") {
-			const dlg = shownInput() as unknown as
-				| { input: { getValue(): string }; onSubmitCallback(v: string): void; onCancelCallback(): void }
-				| undefined;
+			const dlg = activeTextDialog();
 			if (!dlg) return;
-			if (act === "dialog.submit") dlg.onSubmitCallback(dlg.input.getValue());
-			else dlg.onCancelCallback();
+			if (act === "dialog.submit") dlg.submit();
+			else dlg.cancel();
 			tuiRef?.requestRender();
 			scheduleRender(0);
 			return;
@@ -1402,8 +1400,8 @@ export default function (pi: ExtensionAPI) {
 		if (composer && shown === composer) {
 			nodes.push(composerNode(composer));
 			focus = "composer.line/input";
-		} else if (shown instanceof ExtensionInputComponent) {
-			nodes.push(inputDialogNode(shown));
+		} else if (activeTextDialog()) {
+			nodes.push(inputDialogNode(activeTextDialog()!));
 			focus = DIALOG_INPUT;
 		} else if (shown instanceof ExtensionSelectorComponent || isSheet(shown)) {
 			// drawn as a picker sheet in the layer (selectorPicker, currentSheet); keys still reach it through the pty
@@ -1531,14 +1529,22 @@ export default function (pi: ExtensionAPI) {
 		const key = keybindingsRef?.getKeys(binding as never)?.[0] as string | undefined;
 		return key ? key.split("+").map((k) => (k === "escape" ? "esc" : k)) : undefined;
 	};
+	/** `keys` for a picker action from a keybinding, when it is bound. */
+	const withKeys = (binding: string) => {
+		const keys = keyCaps(binding);
+		return keys ? { keys } : {};
+	};
 	const selectListOf = (comp: unknown): SelectList | undefined => {
 		const list = (comp as { selectList?: unknown } | undefined)?.selectList;
 		return list instanceof SelectList ? list : undefined;
 	};
-	const isSheet = (comp: unknown) => comp instanceof ModelSelectorComponent || !!selectListOf(comp);
+	const isSessionList = (comp: unknown): comp is SessionSelectorComponent =>
+		comp instanceof SessionSelectorComponent && (comp as unknown as { mode?: string }).mode !== "rename";
+	const isSheet = (comp: unknown) => comp instanceof ModelSelectorComponent || isSessionList(comp) || !!selectListOf(comp);
 	const currentSheet = (): Sheet | undefined => {
 		const shown = containers().editor?.children?.[0];
 		if (shown instanceof ModelSelectorComponent) return modelSheet(shown);
+		if (isSessionList(shown)) return sessionSheet(shown);
 		const list = selectListOf(shown);
 		return list ? selectListSheet(shown!, list) : undefined;
 	};
@@ -1641,6 +1647,151 @@ export default function (pi: ExtensionAPI) {
 		};
 	};
 
+	/** "3h", "2d": how long ago, for picker columns (a fixed string, so the catalogue does not change every render). */
+	const ago = (at: unknown): string => {
+		const t = at instanceof Date ? at.getTime() : typeof at === "number" || typeof at === "string" ? new Date(at).getTime() : Number.NaN;
+		if (!Number.isFinite(t)) return "";
+		const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+		if (s < 60) return "now";
+		const m = Math.floor(s / 60);
+		if (m < 60) return `${m}m`;
+		const h = Math.floor(m / 60);
+		if (h < 24) return `${h}h`;
+		const d = Math.floor(h / 24);
+		if (d < 30) return d < 7 ? `${d}d` : `${Math.floor(d / 7)}w`;
+		return d < 365 ? `${Math.floor(d / 30)}mo` : `${Math.floor(d / 365)}y`;
+	};
+	const homeShort = (p: unknown) => {
+		const home = process.env.USERPROFILE ?? process.env.HOME;
+		const s = String(p ?? "");
+		return home && s.toLowerCase().startsWith(home.toLowerCase()) ? `~${s.slice(home.length)}` : s;
+	};
+
+	/**
+	 * `/resume` as omp's session picker: this folder / all tabs, the sessions as a tree while threaded
+	 * (a flat list when sorted or searched), message count and age columns, and Resume, Rename and
+	 * Delete (with Tern's confirm strip) as actions. Search keys still go to pi's own field.
+	 */
+	const sessionSheet = (sel: SessionSelectorComponent): Sheet => {
+		type Info = { path: string; name?: string; firstMessage?: string; messageCount?: number; modified?: unknown; cwd?: string };
+		type Row = { session: Info; depth: number };
+		const c = sel as unknown as {
+			sessionList: {
+				filteredSessions: Row[];
+				allSessions: Info[];
+				selectedIndex: number;
+				selectionTouched: boolean;
+				searchInput: { getValue(): string; cursor?: number };
+				confirmingDeletePath: string | null;
+				isCurrentSessionPath(p: string): boolean;
+				onSelect?: (p: string) => void;
+				onCancel?: () => void;
+				onRenameSession?: (p: string) => void;
+				onDeleteSession?: (p: string) => void;
+				startDeleteConfirmationForSelectedSession(): void;
+				setConfirmingDeletePath(p: string | null): void;
+			};
+			header: { loading?: boolean; loadProgress?: { loaded: number; total: number } | null; statusMessage?: { type: string; message: string } | null };
+			scope: "current" | "all";
+			sortMode: "threaded" | "recent" | "relevance";
+			nameFilter: "all" | "named";
+			canRename: boolean;
+			toggleScope(): void;
+			toggleSortMode(): void;
+			toggleNameFilter(): void;
+		};
+		const list = c.sessionList;
+		const rows = list.filteredSessions ?? [];
+		const query = list.searchInput.getValue();
+		const tree = c.sortMode === "threaded" && !query.trim();
+		const current: string[] = [];
+		const items = rows.map(({ session: s, depth }) => {
+			if (list.isCurrentSessionPath(s.path)) current.push(s.path);
+			const label = String(s.name ?? s.firstMessage ?? "").replace(/[\x00-\x1f\x7f]+/g, " ").trim() || "(empty session)";
+			return {
+				id: s.path,
+				label,
+				...(c.scope === "all" && s.cwd ? { detail: homeShort(s.cwd) } : {}),
+				...(s.name ? { tone: "warning" } : {}),
+				...(tree ? { depth } : {}),
+				facts: { msgs: s.messageCount ?? 0, age: ago(s.modified) },
+				title: homeShort(s.path),
+			};
+		});
+		const sortLabel = c.sortMode === "threaded" ? "Threaded" : c.sortMode === "recent" ? "Recent" : "Fuzzy";
+		const deleting = list.confirmingDeletePath;
+		const status = c.header.statusMessage;
+		const progress = c.header.loadProgress;
+		const node = n(
+			"picker",
+			{
+				role: "omp.overlay.sessions",
+				title: "Resume session",
+				icon: "history",
+				noun: "sessions",
+				size: "lg",
+				layout: tree ? "tree" : "rows",
+				preview: "none",
+				query,
+				cursor: list.searchInput.cursor,
+				placeholder: "Search sessions",
+				tabs: [
+					{ id: "current", label: "This folder" },
+					{ id: "all", label: "All" },
+				],
+				tab: c.scope,
+				columns: [
+					{ id: "msgs", head: "Msgs", format: "num", priority: 1 },
+					{ id: "age", head: "Updated", format: "dim", priority: 2 },
+				],
+				items,
+				selected: rows[list.selectedIndex]?.session.path ?? null,
+				current,
+				total: (list.allSessions ?? []).length,
+				state: c.header.loading ? "loading" : status?.type === "error" ? "error" : "ready",
+				message: c.header.loading ? (progress ? `Loading ${progress.loaded}/${progress.total}` : "Loading") : status?.message,
+				empty: c.nameFilter === "named" ? "No named sessions" : c.scope === "current" ? "No sessions in this folder" : "No sessions",
+				confirm: deleting ? { text: "Delete this session?", act: "delete.confirm", label: "Delete" } : null,
+				actions: [
+					{ ...CONFIRM_ACTION, label: "Resume" },
+					...(c.canRename ? [{ id: "rename", label: "Rename", ...withKeys("app.session.rename") }] : []),
+					{ id: "delete", label: "Delete", danger: true, ...withKeys("app.session.delete") },
+					{ id: "sort", label: `Sort: ${sortLabel}`, ...withKeys("app.session.toggleSort") },
+					{ id: "named", label: "Named only", on: c.nameFilter === "named", ...withKeys("app.session.toggleNamedFilter") },
+					CLOSE_ACTION,
+				],
+			},
+			undefined,
+			SHEET_ID,
+		);
+		const selectedPath = () => list.filteredSessions[list.selectedIndex]?.session.path;
+		return {
+			node,
+			pick(activate, item) {
+				const index = list.filteredSessions.findIndex((r) => r.session.path === item);
+				if (index < 0) return;
+				list.selectedIndex = index;
+				list.selectionTouched = true;
+				if (activate) list.onSelect?.(item);
+			},
+			act(act, value) {
+				const path = selectedPath();
+				if (act === "confirm" && path) list.onSelect?.(path);
+				else if (act === "close") list.onCancel?.();
+				else if (act === "rename" && path) list.onRenameSession?.(path);
+				else if (act === "delete") list.startDeleteConfirmationForSelectedSession();
+				else if (act === "delete.confirm" && list.confirmingDeletePath) {
+					const target = list.confirmingDeletePath;
+					list.setConfirmingDeletePath(null);
+					list.onDeleteSession?.(target);
+				} else if (act === "cancel" && list.confirmingDeletePath) list.setConfirmingDeletePath(null); // Tern's "Keep"
+				else if (act === "sort") c.toggleSortMode();
+				else if (act === "named") c.toggleNameFilter();
+				else if ((value === "current" || value === "all") && value !== c.scope) c.toggleScope();
+			},
+		};
+	};
+
 	/** Any selector built on pi-tui's SelectList (thinking level, theme, …): its texts above the list head the sheet. */
 	const selectListSheet = (comp: Component, list: SelectList): Sheet => {
 		type Item = { value: string; label?: string; description?: string };
@@ -1699,12 +1850,36 @@ export default function (pi: ExtensionAPI) {
 		return shown instanceof ExtensionSelectorComponent ? shown : undefined;
 	};
 
-	/** `ctx.ui.input` in the composer's place: title, the field, Cancel and Submit (omp's hook input). */
+	/**
+	 * A one-line text prompt in the composer's place: `ctx.ui.input`, or renaming a session in
+	 * `/resume`. Described as omp's hook input card; its field takes Tern's edits, its buttons submit
+	 * or cancel through the dialog's own callbacks.
+	 */
+	type TextDialog = { title: string; detail: string; field: DialogField; submit(): void; cancel(): void };
+	const activeTextDialog = (): TextDialog | undefined => {
+		const shown = containers().editor?.children?.[0];
+		if (shown instanceof ExtensionInputComponent) {
+			const d = shown as unknown as { input: DialogField; onSubmitCallback(v: string): void; onCancelCallback(): void };
+			return { ...dialogTitle(shown), field: d.input, submit: () => d.onSubmitCallback(d.input.getValue()), cancel: () => d.onCancelCallback() };
+		}
+		if (shown instanceof SessionSelectorComponent) {
+			const s = shown as unknown as { mode: string; renameInput: DialogField & { onSubmit?: (v: string) => void }; exitRenameMode(): void };
+			if (s.mode !== "rename") return undefined;
+			return {
+				title: "Rename session",
+				detail: "An empty name removes it",
+				field: s.renameInput,
+				submit: () => s.renameInput.onSubmit?.(s.renameInput.getValue()),
+				cancel: () => s.exitRenameMode(),
+			};
+		}
+		return undefined;
+	};
 	const DIALOG_INPUT = "dialog.field/input";
-	const inputDialogNode = (dlg: ExtensionInputComponent): TspNode => {
-		const field = (dlg as unknown as { input: { getValue(): string; cursor?: number } }).input;
+	const inputDialogNode = (dlg: TextDialog): TspNode => {
+		const field = dlg.field;
 		const value = field.getValue();
-		const { title, detail } = dialogTitle(dlg);
+		const { title, detail } = dlg;
 		return col(
 			[
 				col(
@@ -1738,10 +1913,6 @@ export default function (pi: ExtensionAPI) {
 			{ role: "omp.overlay.hook-input" },
 			"dialog",
 		);
-	};
-	const shownInput = (): ExtensionInputComponent | undefined => {
-		const shown = containers().editor?.children?.[0];
-		return shown instanceof ExtensionInputComponent ? shown : undefined;
 	};
 
 	/**
