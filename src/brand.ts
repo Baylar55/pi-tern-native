@@ -51,6 +51,15 @@ export const PI_STYLES = `
 [data-role='omp.composer.model'] .sf-t-accent {
 	color: light-dark(#3f7ea6, #7fb3d4) !important;
 }
+/* the start-screen logo is decoration: Tern opens image nodes in its viewer on click, not this one */
+[data-role='omp.welcome.logo'],
+[data-role='omp.welcome.logo'] * {
+	pointer-events: none !important;
+	cursor: default !important;
+}
+[data-role='omp.welcome.lockup'] {
+	user-select: none !important;
+}
 /* Tern's own folder chip: the git chip already says where pi works, and omp shows none */
 [data-role='omp.composer.bar'] > .sf-place {
 	display: none !important;
