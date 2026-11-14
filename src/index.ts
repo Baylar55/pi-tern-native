@@ -380,6 +380,14 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (turnAction(act, target.split(/[./]/)[0] ?? "")) return;
+		if (act === "copy-error") {
+			const value = copyErrors.get(target.split(/[./]/)[0] ?? "");
+			if (value) {
+				rawWrite(`\x1b]52;c;${Buffer.from(value, "utf8").toString("base64")}\x07`);
+				toast("Error copied");
+			}
+			return;
+		}
 		if (act === "copy-message" || act === "copy-answer") {
 			const owner = target.split(/[./]/)[0] ?? "";
 			const value = copyTexts.get(owner);
@@ -753,6 +761,7 @@ export default function (pi: ExtensionAPI) {
 		// copy texts of messages no longer shown (after /new, /resume, /tree) can go
 		if (copyTexts.size > live.size) for (const id of copyTexts.keys()) if (!live.has(id)) copyTexts.delete(id);
 		if (turnComps.size > live.size) for (const id of turnComps.keys()) if (!live.has(id)) turnComps.delete(id);
+		if (copyErrors.size > live.size) for (const id of copyErrors.keys()) if (!live.has(id)) copyErrors.delete(id);
 		const now = Date.now();
 		toasts = toasts.filter((t) => t.until > now);
 		for (const t of toasts) out.push(n("toast", { text: t.text, ttl: 2400, role: "omp.toast.status" }, undefined, t.id));
@@ -1019,13 +1028,44 @@ export default function (pi: ExtensionAPI) {
 			if (msg.stopReason === "aborted") {
 				kids.push(spans([span(message, "error")], { wrap: "word", role: "omp.assistant.abort" }, "error"));
 			} else {
+				// "400 bad request" → a "400" chip, then the message (as omp's error frame)
+				const code = /^(\d{3})\b[\s:-]*/.exec(message);
+				let detail = code ? message.slice(code[0].length) || message : message;
+				// providers often return a JSON body: show its message (Copy error keeps all of it)
+				try {
+					const body = JSON.parse(detail) as { message?: unknown; error?: { message?: unknown } };
+					const said = body?.error?.message ?? body?.message;
+					if (typeof said === "string" && said.trim()) detail = said.trim();
+				} catch {
+					/* plain text */
+				}
+				copyErrors.set(idOf(comp, "a"), message);
+				const button = (act: string, label: string, title: string, keys?: string[]) =>
+					row(keys ? [text(label, {}, "label"), n("kbd", { keys }, undefined, "key")] : [text(label, {}, "label")], { gap: "xs", role: "omp.error.action", actions: { click: act }, title }, act);
+				const modelKeys = keyCaps("app.model.select");
 				kids.push(
 					n(
 						"card",
 						{ role: "omp.error", tone: "error" },
 						[
-							row([spans([span("Request failed", "error strong")])], { gap: "sm" }, "head"),
-							spans([span(message, "mono")], { wrap: "word", role: "omp.error.message" }, "message"),
+							row(
+								[
+									spans([span("Request failed", "error strong")], {}, "title"),
+									...(code ? [n("badge", { text: code[1], tone: "error", role: "omp.error.code" }, undefined, "code")] : []),
+								],
+								{ gap: "sm" },
+								"head",
+							),
+							spans([span(detail, "mono")], { wrap: "word", role: "omp.error.message" }, "message"),
+							row(
+								[
+									button("retry-turn", "Retry", "Send the prompt again from before this reply"),
+									button("copy-error", "Copy error", "Copy the error message"),
+									button("status.model", "Switch model", "Pick another model, then retry", modelKeys),
+								],
+								{ gap: "sm", role: "omp.error.actions" },
+								"actions",
+							),
 						],
 						"error",
 					),
@@ -2473,6 +2513,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// ---------- turn actions (hold menu, rewind button) ----------
+
+	/** Failed replies' error text by node id, for their Copy error button. */
+	const copyErrors = new Map<string, string>();
 
 	/** Transcript node id → the message component it describes, for actions on a turn. */
 	const turnComps = new Map<string, object>();

@@ -5,7 +5,7 @@
  *   node test/mock-llm.mjs [port]      (default 47899)
  *
  * It streams a canned answer word by word (40ms a word) and ends with usage. Prompts that
- * contain "run-bash" get a `bash` tool call first; prompts that whose last message says "slow" stream for ~12s.
+ * contain "run-bash" get a `bash` tool call first, "fail-please" an HTTP 400; prompts whose last message says "slow" stream for ~12s.
  */
 import { createServer } from "node:http";
 
@@ -35,6 +35,12 @@ createServer(async (req, res) => {
 	console.log(`from ${req.socket.remoteAddress}:${req.socket.remotePort} ua=${req.headers["user-agent"]} via=${req.headers.via ?? "-"}`);
 	console.log(`${new Date().toISOString()} ${req.url} stream=${body.stream} messages=${messages.length} last=${last.role}: ${lastText.slice(0, 60)}`);
 
+	// "fail-please" in the latest prompt: a non-retryable API error, for the error card
+	if (last.role === "user" && /fail-please/.test(lastText)) {
+		res.writeHead(400, { "content-type": "application/json" });
+		res.end(JSON.stringify({ error: { message: "mock: the request was rejected (fixture)", type: "invalid_request_error" } }));
+		return;
+	}
 	res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
 	const send = (delta, extra = {}) =>
 		/* returns false under backpressure */ res.write(`data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", model: body.model, choices: [{ index: 0, delta, finish_reason: null }], ...extra })}\n\n`);
