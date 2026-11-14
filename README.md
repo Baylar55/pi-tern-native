@@ -19,9 +19,9 @@ Outside Tern, or in a normal shell block, pi is untouched.
 | Slash and `@` completion | Tern's native picker anchored at the caret, with the typed prefix highlighted; click a row to select it, double-click to complete |
 | Queue | Steering and follow-up messages queued while pi works show as omp's pills above the composer, with a count and an Edit button that puts them back in the editor |
 | Working indicator | Spinner, elapsed time and "Working…" above the composer, with a Stop button |
-| User messages | Right-aligned bubbles with a copy button, the send time, and "Copy message" on long-press |
+| User messages | Right-aligned bubbles with a hover toolbar: copy, rewind (opens `/tree` at the message, so pi asks about a summary as usual), retry (back to before the prompt and send it again) and the send time. A long press (phones) also offers Edit & resend (the prompt back in the composer) and Fork from here (a new session up to the message) |
 | Images | Pasted images (pi saves them to a temp file and puts its path in your message) become chips above the text, with a thumbnail, the pixel size and a remove button. The long path is hidden in the editor and taken out of the sent bubble, which shows the image as a thumbnail instead (click to zoom). Images the model reads appear inside the Read card, capped in height. The model still receives exactly the same message. |
-| Answers | Native markdown, collapsible thinking sections ("Thought for 4s"), and a hover row with copy, turn duration, tokens and cost |
+| Answers | Native markdown, collapsible thinking sections ("Thought for 4s"), and a hover row with copy, rewind, retry, turn duration, tokens and cost; a long press also offers Fork from here |
 | Tool cards | Bash (command, output and Done/Exit footer with timing), Read/Write (file preview with syntax highlighting), Edit (real diff), and a generic card for any other tool |
 | Notices | pi's warnings, errors and status lines as icon notices, without the terminal colour codes |
 | History | Compactions and branch summaries as omp's slim dividers ("Compacted · 142K tokens before"), the summary inside; skill invocations as a collapsible "Skill name" row; extension messages without a renderer of their own as a card |
@@ -170,8 +170,7 @@ per keystroke.
 
 - **Relies on pi internals.** It reads fields of pi's own components (for example a message component's
   `lastMessage`) and the order of the containers in pi's interactive mode, so a pi update may need small fixes.
-- **Not yet ported from omp:** the "Pseudo" shell view in Bash cards; rewind, retry and fork in the long-press
-  menu; and native drawing of the `/settings` submenus (they are pi's own rendering over the page).
+- **Not yet ported from omp:** the "Pseudo" shell view in Bash cards, and native drawing of the `/settings` submenus (they are pi's own rendering over the page).
 - **Extension overlays** are pi's own rendering inside a Tern overlay, not native widgets.
 - **Images are recognised by path:** any absolute path to an existing `.png`, `.jpg`, `.gif`, `.webp` or `.bmp`
   file in a message is shown as an image (up to 20 MB). Paths to files that no longer exist stay as text.

@@ -29,6 +29,7 @@ import {
 	CustomMessageComponent,
 	DynamicBorder,
 	type ExtensionAPI,
+	type ExtensionCommandContext,
 	type ExtensionContext,
 	ExtensionInputComponent,
 	ExtensionSelectorComponent,
@@ -353,7 +354,12 @@ export default function (pi: ExtensionAPI) {
 			composer = this;
 			keybindingsRef = keybindings;
 		}
+		/** Commands the surface runs on the user's behalf (turn actions, opening /tree) stay out of the input history. */
+		override addToHistory(text: string): void {
+			if (!quietSubmit) super.addToHistory(text);
+		}
 	}
+	let quietSubmit = false;
 
 	// ---------- input: TSP events ----------
 	const onInput = (data: string) => {
@@ -574,6 +580,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			return;
 		}
+		if (turnAction(act, target.split(/[./]/)[0] ?? "")) return;
 		if (act === "copy-message" || act === "copy-answer") {
 			const owner = target.split(/[./]/)[0] ?? "";
 			const value = copyTexts.get(owner);
@@ -901,6 +908,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		// copy texts of messages no longer shown (after /new, /resume, /tree) can go
 		if (copyTexts.size > live.size) for (const id of copyTexts.keys()) if (!live.has(id)) copyTexts.delete(id);
+		if (turnComps.size > live.size) for (const id of turnComps.keys()) if (!live.has(id)) turnComps.delete(id);
 		const now = Date.now();
 		toasts = toasts.filter((t) => t.until > now);
 		for (const t of toasts) out.push(n("toast", { text: t.text, ttl: 2400, role: "omp.toast.status" }, undefined, t.id));
@@ -1039,6 +1047,7 @@ export default function (pi: ExtensionAPI) {
 
 	const userNode = (comp: UserMessageComponent): TspNode => {
 		const c = comp as unknown as { text: string; timestamp?: string };
+		turnComps.set(idOf(comp, "u"), comp);
 		const cached = nodeCache.get(comp);
 		if (cached) return cached.node;
 		const time = clock(c.timestamp ?? Date.now());
@@ -1052,12 +1061,22 @@ export default function (pi: ExtensionAPI) {
 			{
 				role: "omp.user",
 				tone: "user",
-				actions: { hold: [{ id: "copy-message", label: "Copy message", icon: "copy" }] },
+				actions: {
+					hold: [
+						{ id: "copy-message", label: "Copy message", icon: "copy" },
+						{ id: "edit-turn", label: "Edit & resend", icon: "edit", detail: "To composer" },
+						{ id: "retry-turn", label: "Retry turn", icon: "refresh" },
+						{ id: "rewind-turn", label: "Rewind to here\u2026", icon: "rewind" },
+						{ id: "fork-turn", label: "Fork from here", icon: "branch", detail: "New session" },
+					],
+				},
 			},
 			[
 				row(
 					[
 						icon("copy", { role: "omp.user.tool", title: "Copy message", aria: "Copy message", actions: { click: "copy-message" } }, "copy"),
+						icon("rewind", { role: "omp.user.tool", title: "Rewind the conversation to this message", aria: "Rewind", actions: { click: "rewind" } }, "rewind"),
+						icon("refresh", { role: "omp.user.tool", title: "Retry: send this message again from here", aria: "Retry", actions: { click: "retry-turn" } }, "retry"),
 						...(time
 							? [
 									text("\u00b7", {}, "dot"),
@@ -1109,6 +1128,7 @@ export default function (pi: ExtensionAPI) {
 		const c = comp as unknown as { lastMessage?: AssistantMessage; isStreaming?: boolean; hideThinkingBlock?: boolean };
 		const msg = c.lastMessage;
 		if (!msg) return null;
+		turnComps.set(idOf(comp, "a"), comp);
 		const streaming = c.isStreaming === true;
 		const sig = [
 			streaming,
@@ -1198,9 +1218,11 @@ export default function (pi: ExtensionAPI) {
 						...(answer
 							? [
 									icon("copy", { role: "omp.turn.copy", title: "Copy answer", aria: "Copy answer", actions: { click: "copy-answer" } }, "copy"),
-									text("\u00b7", {}, "dot"),
 								]
 							: []),
+						icon("rewind", { role: "omp.turn.copy", title: "Rewind the conversation to this reply", aria: "Rewind", actions: { click: "rewind" } }, "rewind"),
+						icon("refresh", { role: "omp.turn.copy", title: "Retry: ask again for this reply", aria: "Retry", actions: { click: "retry-turn" } }, "retry"),
+						text("\u00b7", {}, "dot"),
 						text(`${parts.join(" \u00b7 ")} this turn`, {}, "text"),
 					],
 					{
@@ -1223,7 +1245,19 @@ export default function (pi: ExtensionAPI) {
 		if (kids.length === 0) return null;
 		const node = col(
 			kids,
-			final && answer ? { role: "omp.assistant", actions: { hold: [{ id: "copy-answer", label: "Copy reply", icon: "copy" }] } } : { role: "omp.assistant" },
+			final
+				? {
+						role: "omp.assistant",
+						actions: {
+							hold: [
+								...(answer ? [{ id: "copy-answer", label: "Copy reply", icon: "copy" }] : []),
+								{ id: "retry-turn", label: "Retry turn", icon: "refresh" },
+								{ id: "rewind-turn", label: "Rewind to here\u2026", icon: "rewind" },
+								{ id: "fork-turn", label: "Fork from here", icon: "branch", detail: "New session" },
+							],
+						},
+					}
+				: { role: "omp.assistant" },
 			id,
 		);
 		nodeCache.set(comp, { key: sig, node });
@@ -2612,6 +2646,115 @@ export default function (pi: ExtensionAPI) {
 		return col(kids, { role: shell ? "omp.editor.bash" : "omp.editor", tone: running ? "pending" : undefined }, "composer");
 	};
 
+	// ---------- turn actions (hold menu, rewind button) ----------
+
+	/** Transcript node id → the message component it describes, for actions on a turn. */
+	const turnComps = new Map<string, object>();
+
+	type MessageEntry = { id: string; parentId?: string | null; type: string; message?: { role?: string; content?: unknown } };
+	const entryText = (e: MessageEntry | undefined): string => {
+		const content = e?.message?.content;
+		if (typeof content === "string") return content;
+		return Array.isArray(content) ? content.filter((p: any) => p?.type === "text").map((p: any) => p.text).join("\n") : "";
+	};
+
+	/**
+	 * The session entry a user or assistant component shows. Rebuilt transcripts carry the entry id;
+	 * live ones do not, so the components of that role are paired with the current branch's
+	 * messages of that role from the end (the newest component is the newest entry).
+	 */
+	const entryIdFor = (comp: object): string | undefined => {
+		const own = (comp as { messageId?: unknown }).messageId;
+		if (typeof own === "string" && own) return own;
+		const ctx = ctxRef;
+		if (!ctx) return undefined;
+		const user = comp instanceof UserMessageComponent;
+		const role = user ? "user" : "assistant";
+		const comps = (containers().chat?.children ?? []).filter((k) =>
+			user ? k instanceof UserMessageComponent : k instanceof AssistantMessageComponent && !(k as unknown as { isStreaming?: boolean }).isStreaming,
+		);
+		const pos = comps.indexOf(comp as Component);
+		if (pos < 0) return undefined;
+		const entries = (ctx.sessionManager.getBranch() as MessageEntry[]).filter((e) => e.type === "message" && e.message?.role === role);
+		const paired = entries[entries.length - (comps.length - pos)];
+		if (!user) return paired?.id;
+		// user text can sit next to a skill block; prefer an entry that really holds this text
+		const text = String((comp as unknown as { text?: unknown }).text ?? "").trim();
+		if (paired && entryText(paired).includes(text)) return paired.id;
+		return [...entries].reverse().find((e) => entryText(e).includes(text))?.id ?? paired?.id;
+	};
+
+	/** Submit through pi's own path (commands, /tree) without touching the draft or the history. */
+	const quietly = async (text: string) => {
+		const ed = composer as unknown as { onSubmit?: (t: string) => unknown; getText(): string; setText(t: string): void } | undefined;
+		if (!ed?.onSubmit) return;
+		const draft = ed.getText();
+		quietSubmit = true;
+		try {
+			await ed.onSubmit(text);
+		} finally {
+			quietSubmit = false;
+		}
+		if (draft && !ed.getText()) ed.setText(draft);
+	};
+
+	/** "Rewind to here…": pi's /tree with this message selected, so the summary question and the rest are pi's. */
+	const openTreeAt = async (entryId: string) => {
+		await quietly("/tree");
+		const shown = containers().editor?.children?.[0];
+		if (!(shown instanceof TreeSelectorComponent)) return;
+		const t = (shown as unknown as { treeList: { filteredNodes: { node: { entry: { id: string } } }[]; selectedIndex: number } }).treeList;
+		const index = t.filteredNodes.findIndex((f) => f.node.entry.id === entryId);
+		if (index >= 0) t.selectedIndex = index;
+		tuiRef?.requestRender();
+		scheduleRender(0);
+	};
+
+	/** A turn action from the transcript (`edit-turn`, `retry-turn`, `fork-turn`, `rewind`) on the node `owner`. */
+	const turnAction = (act: string, owner: string): boolean => {
+		const turnAct = act === "rewind" || act === "rewind-turn" ? "rewind" : /^(edit|retry|fork)-turn$/.exec(act)?.[1];
+		if (!turnAct) return false;
+		const comp = turnComps.get(owner);
+		const entryId = comp ? entryIdFor(comp) : undefined;
+		if (!entryId) {
+			toast("That message is not in the session yet");
+			return true;
+		}
+		if (turnAct === "rewind") void openTreeAt(entryId);
+		else void quietly(`/tern-native turn ${turnAct} ${entryId}`);
+		return true;
+	};
+
+	/**
+	 * Runs as the `/tern-native turn …` command, which is what gives it navigateTree and fork.
+	 * Edit & resend: back to before the prompt, its text in the editor. Retry: the same, then the
+	 * prompt is sent again (an assistant turn retries the prompt that started it). Fork: a new
+	 * session up to the message (before a prompt, which then waits in the editor).
+	 */
+	const runTurn = async (act: string, entryId: string, ctx: ExtensionCommandContext) => {
+		if (!ctx.isIdle()) {
+			ctx.ui.notify("pi is still working: stop it first (Esc)", "warning");
+			return;
+		}
+		const entry = ctx.sessionManager.getEntry(entryId) as MessageEntry | undefined;
+		if (!entry) return ctx.ui.notify("That message is no longer in the session", "warning");
+		const role = entry.message?.role;
+		if (act === "fork") {
+			await ctx.fork(entryId, { position: role === "user" ? "before" : "at" });
+			return;
+		}
+		let prompt: MessageEntry | undefined = entry;
+		while (prompt && prompt.message?.role !== "user") prompt = prompt.parentId ? (ctx.sessionManager.getEntry(prompt.parentId) as MessageEntry | undefined) : undefined;
+		if (!prompt) return ctx.ui.notify("No prompt before that message", "warning");
+		const draft = composer?.getText() ?? "";
+		const result = await ctx.navigateTree(prompt.id);
+		if (result.cancelled || act !== "retry") return;
+		// navigating to a prompt puts its text in an empty editor: it is being sent instead
+		if (composer && composer.getText() !== draft) composer.setText(draft);
+		const content = prompt.message?.content;
+		pi.sendUserMessage((typeof content === "string" || Array.isArray(content) ? content : entryText(prompt)) as never);
+	};
+
 	// ---------- generation rate ----------
 
 	/**
@@ -2820,7 +2963,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("tern-native", {
 		description: "Native Tern surface: status",
-		handler: async (_args, ctx) => {
+		handler: async (args, ctx) => {
+			const turn = /^turn ([a-z-]+) (\S+)$/.exec(args.trim());
+			if (turn) return runTurn(turn[1]!, turn[2]!, ctx);
 			ctx.ui.notify(
 				active ? `Native Tern surface ${sf} · Tern ${hello?.ver ?? "?"} · ${cols} cols · ${hello?.kinds.length ?? 0} kinds` : "Native Tern surface is not active",
 				"info",
