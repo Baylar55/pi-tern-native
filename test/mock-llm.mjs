@@ -5,7 +5,7 @@
  *   node test/mock-llm.mjs [port]      (default 47899)
  *
  * It streams a canned answer word by word (40ms a word) and ends with usage. Prompts that
- * contain "run-bash" get a `bash` tool call first, "fail-please" an HTTP 400; prompts whose last message says "slow" stream for ~12s.
+ * contain "run-bash" (or run-grep, run-find, run-ls) get that tool call first, "fail-please" an HTTP 400; prompts whose last message says "slow" stream for ~12s.
  */
 import { createServer } from "node:http";
 
@@ -56,9 +56,18 @@ createServer(async (req, res) => {
 	};
 
 	send({ role: "assistant", content: "" });
-	if (last.role === "user" && /run-bash/.test(lastText)) {
-		send({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "bash", arguments: "" } }] });
-		send({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ command: "echo hello from mock" }) } }] });
+	// "run-<tool>" in the latest prompt: that tool is called first, with these arguments
+	const TOOL_CALLS = {
+		"run-bash": ["bash", { command: "echo hello from mock" }],
+		"run-grep": ["grep", { pattern: "registerCommand", path: "src" }],
+		"run-find": ["find", { pattern: "*.ts" }],
+		"run-ls": ["ls", { path: "." }],
+	};
+	const wanted = last.role === "user" ? Object.keys(TOOL_CALLS).find((k) => lastText.includes(k)) : undefined;
+	if (wanted) {
+		const [name, args] = TOOL_CALLS[wanted];
+		send({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name, arguments: "" } }] });
+		send({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify(args) } }] });
 		finish("tool_calls", 20);
 		return;
 	}

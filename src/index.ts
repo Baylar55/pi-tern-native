@@ -1265,6 +1265,8 @@ export default function (pi: ExtensionAPI) {
 						: [],
 				idOf(comp, "t"),
 			);
+		} else if ((name === "grep" || name === "find" || name === "ls") && status !== "error") {
+			node = searchToolNode(name, args, out, base, idOf(comp, "t"));
 		} else {
 			const summary = Object.entries(args)
 				.filter(([, v]) => typeof v === "string" || typeof v === "number" || typeof v === "boolean")
@@ -1280,6 +1282,103 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (done) nodeCache.set(comp, { key: `done:${cols}`, node });
 		return node;
+	};
+
+	/**
+	 * pi's grep, find and ls as omp's search cards: the pattern or path as the target, counts as
+	 * the facts, and the result as rows (matches grouped by file, paths with a file or folder icon)
+	 * instead of raw output. pi's notices (limits reached) stay at the end.
+	 */
+	const MAX_SEARCH_ROWS = 200;
+	const searchToolNode = (name: "grep" | "find" | "ls", args: any, out: string, base: Record<string, unknown>, id: string): TspNode => {
+		// a trailing "[… limit reached]" paragraph is pi's notice, not a result
+		const notice = /\n\n\[([^\]]+)\]\s*$/.exec(out);
+		const body = (notice ? out.slice(0, notice.index) : out).replace(/\s+$/, "");
+		const empty = !body || /^(No matches found|No files found matching pattern|\(empty directory\))$/.test(body);
+		const lines = empty ? [] : body.split(/\r?\n/);
+		const kids: TspNode[] = [];
+		const more = (count: number, noun: string) =>
+			count > 0 ? [spans([span(`+${count} more ${noun}`, "dim")], {}, "more")] : [];
+		const pathRow = (path: string, key: string) =>
+			row(
+				[icon(path.endsWith("/") ? "folder" : "file", {}, "icon"), spans([span(path, "mono")], { wrap: "none", truncate: "middle", grow: 1, shrink: 1 }, "path")],
+				{ gap: "sm", align: "center", role: "omp.tool.find.hit" },
+				key,
+			);
+		let facts: string[] = [];
+		let target: string | undefined;
+		let title = "";
+		if (name === "grep") {
+			title = "Grep";
+			target = String(args.pattern ?? "");
+			// "path:12: text" is a match, "path-12- text" a context line
+			const files = new Map<string, { n: number; lines: string[] }>();
+			let matches = 0;
+			for (const line of lines) {
+				const m = /^(.+?)([:-])(\d+)\2 ?(.*)$/.exec(line);
+				if (!m) continue;
+				const f = files.get(m[1]!) ?? { n: 0, lines: [] };
+				if (m[2] === ":") {
+					f.n++;
+					matches++;
+				}
+				f.lines.push(`${m[3]!.padStart(4)}${m[2] === ":" ? ":" : " "} ${m[4]}`);
+				files.set(m[1]!, f);
+			}
+			facts = [`${matches} ${matches === 1 ? "match" : "matches"}`, `${files.size} ${files.size === 1 ? "file" : "files"}`];
+			let shown = 0;
+			for (const [path, f] of files) {
+				if (shown >= MAX_SEARCH_ROWS) break;
+				shown += f.lines.length;
+				kids.push(
+					col(
+						[
+							row(
+								[
+									icon("file", {}, "icon"),
+									spans([span(path, "mono strong")], { wrap: "none", truncate: "middle", grow: 1, shrink: 1 }, "path"),
+									spans([span(String(f.n), "dim")], { wrap: "none" }, "count"),
+								],
+								{ gap: "sm", align: "center", role: "omp.tool.search.file" },
+								"head",
+							),
+							n("code", { text: f.lines.join("\n"), lang: langOf(path), role: "omp.tool.grep.lines" }, undefined, "lines"),
+						],
+						{ gap: "xs" },
+						`f${kids.length}`,
+					),
+				);
+			}
+			kids.push(...more(files.size - kids.length, "files"));
+		} else {
+			const isLs = name === "ls";
+			title = isLs ? "List" : "Find";
+			target = isLs ? String(args.path ?? ".") : String(args.pattern ?? "");
+			const dirs = lines.filter((l) => l.endsWith("/")).length;
+			facts = isLs
+				? [`${dirs} ${dirs === 1 ? "folder" : "folders"}`, `${lines.length - dirs} ${lines.length - dirs === 1 ? "file" : "files"}`]
+				: [`${lines.length} ${lines.length === 1 ? "result" : "results"}`];
+			lines.slice(0, MAX_SEARCH_ROWS).forEach((l, i) => kids.push(pathRow(l, `p${i}`)));
+			kids.push(...more(lines.length - MAX_SEARCH_ROWS, isLs ? "entries" : "results"));
+		}
+		if (empty) kids.push(spans([span(body || "Nothing found", "muted")], { wrap: "word" }, "empty"));
+		if (notice) kids.push(row([icon("warning", { tone: "warning" }, "icon"), spans([span(notice[1]!, "muted")], { wrap: "word", grow: 1, shrink: 1 }, "text")], { gap: "sm", align: "start", role: "omp.tool.notice" }, "notice"));
+		const where = name !== "ls" && args.path ? `in ${args.path}` : undefined;
+		return n(
+			"tool",
+			{
+				...base,
+				title,
+				target,
+				targetKind: name === "ls" ? "path" : "pattern",
+				meta: [...(where ? [where] : []), ...(args.glob ? [String(args.glob)] : []), ...(empty ? [] : facts)],
+				frame: "card",
+				collapsed: true,
+				preview: { lines: 10 },
+			},
+			kids,
+			id,
+		);
 	};
 
 	const userBashNode = (comp: BashExecutionComponent): TspNode => {
