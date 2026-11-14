@@ -35,6 +35,7 @@ import {
 	type KeybindingsManager,
 	ModelSelectorComponent,
 	SessionSelectorComponent,
+	SettingsSelectorComponent,
 	TreeSelectorComponent,
 	type ReadonlyFooterDataProvider,
 	SkillInvocationMessageComponent,
@@ -416,6 +417,13 @@ export default function (pi: ExtensionAPI) {
 			case "select":
 			case "activate":
 				return pick(body.ev === "activate", String(body.id ?? ""), String(body.item ?? ""));
+			case "change":
+				if (body.id === SHEET_ID) {
+					currentSheet()?.change?.(String(body.item ?? ""), body.value);
+					tuiRef?.requestRender();
+					scheduleRender(0);
+				}
+				return;
 			case "send":
 				if (composer && typeof body.text === "string" && body.text.trim()) {
 					// submit the given text; a draft already in the composer stays there (TSP `send`)
@@ -1522,7 +1530,12 @@ export default function (pi: ExtensionAPI) {
 	 * in the editor slot is described as one `picker` in the layer, with handlers for its pointer
 	 * events. Keys still reach the selector through the pty, so search and arrows work as in pi.
 	 */
-	type Sheet = { node: TspNode; pick(activate: boolean, item: string): void; act(act: string, value?: string): void };
+	type Sheet = {
+		node: TspNode;
+		pick(activate: boolean, item: string): void;
+		act(act: string, value?: string): void;
+		change?(item: string, value: unknown): void;
+	};
 	const SHEET_ID = "sheet";
 	const CONFIRM_ACTION = { id: "confirm", label: "Select", keys: ["enter"], primary: true };
 	const CLOSE_ACTION = { id: "close", label: "Close", keys: ["esc"], end: true };
@@ -1544,9 +1557,14 @@ export default function (pi: ExtensionAPI) {
 	const isTreeList = (comp: unknown): comp is TreeSelectorComponent =>
 		comp instanceof TreeSelectorComponent && !(comp as unknown as { labelInput?: unknown }).labelInput;
 	const isSheet = (comp: unknown) =>
-		comp instanceof ModelSelectorComponent || isSessionList(comp) || isTreeList(comp) || !!selectListOf(comp);
+		comp instanceof ModelSelectorComponent ||
+		comp instanceof SettingsSelectorComponent ||
+		isSessionList(comp) ||
+		isTreeList(comp) ||
+		!!selectListOf(comp);
 	const currentSheet = (): Sheet | undefined => {
 		const shown = containers().editor?.children?.[0];
+		if (shown instanceof SettingsSelectorComponent) return settingsSheet(shown);
 		if (shown instanceof ModelSelectorComponent) return modelSheet(shown);
 		if (isSessionList(shown)) return sessionSheet(shown);
 		if (isTreeList(shown)) return treeSheet(shown);
@@ -1903,6 +1921,102 @@ export default function (pi: ExtensionAPI) {
 					t.foldedNodes.clear();
 					t.applyFilter();
 				}
+			},
+		};
+	};
+
+	/**
+	 * `/settings` as Tern's native settings page (`prefs`): every setting a row, on/off settings as
+	 * switches, short value lists as segmented choices, longer ones as menus, and settings with a
+	 * submenu (thinking level, theme, …) as buttons that open it. An open submenu is pi's own
+	 * rendering, placed over the page; its keys go to pi as usual.
+	 */
+	const settingsSheet = (sel: SettingsSelectorComponent): Sheet => {
+		type Item = { id: string; label: string; description?: string; currentValue: string; values?: string[]; submenu?: unknown };
+		const list = (sel as unknown as { settingsList: unknown }).settingsList as {
+			items: Item[];
+			filteredItems: Item[];
+			searchEnabled?: boolean;
+			searchInput?: { getValue(): string; cursor?: number };
+			selectedIndex: number;
+			submenuComponent: Component | null;
+			onChange(id: string, value: string): void;
+			onCancel(): void;
+			selectItem(id: string): void;
+			activateItem(): void;
+			handleInput(data: string): void;
+		};
+		const shown = list.searchEnabled ? list.filteredItems : list.items;
+		const isSwitch = (it: Item) => it.values?.length === 2 && it.values.includes("true") && it.values.includes("false");
+		const control = (it: Item) => {
+			if (isSwitch(it)) return { k: "switch", on: it.currentValue === "true" };
+			if (it.values?.length) {
+				return {
+					k: "choice",
+					value: it.currentValue,
+					options: it.values.map((v) => ({ value: v, label: v })),
+					style: it.values.length <= 4 && it.values.every((v) => v.length <= 12) ? "segmented" : "menu",
+				};
+			}
+			return { k: "action", label: stripAnsi(it.currentValue) || "Open", act: `open:${it.id}` };
+		};
+		const submenu = list.submenuComponent;
+		const editor = submenu ? ansiNode(submenu, "se", "pi.settings.submenu", Math.min(54, readerCols())) : null;
+		const query = list.searchEnabled ? list.searchInput?.getValue() : undefined;
+		const node = n(
+			"prefs",
+			{
+				role: "omp.overlay.settings",
+				title: "pi settings",
+				pages: [{ id: "general", label: "General", icon: "settings" }],
+				page: "general",
+				...(query ? { query, cursor: list.searchInput?.cursor } : {}),
+				sections: [
+					{
+						id: "general",
+						title: "General",
+						rows: shown.map((it) => ({
+							id: it.id,
+							label: stripAnsi(it.label),
+							...(it.description ? { hint: stripAnsi(it.description) } : {}),
+							control: control(it),
+						})),
+					},
+				],
+				focus: shown[list.selectedIndex]?.id ?? null,
+				editing: null,
+			},
+			editor ? [col([editor], { role: "omp.prefs.editor" }, "editor")] : undefined,
+			SHEET_ID,
+		);
+		const open = (id: string) => {
+			if (list.submenuComponent) list.handleInput("\x1b");
+			list.selectItem(id);
+			list.activateItem();
+		};
+		return {
+			node,
+			pick(activate, item) {
+				if (!shown.some((it) => it.id === item)) return;
+				if (activate) return open(item);
+				if (list.submenuComponent) list.handleInput("\x1b");
+				list.selectItem(item);
+			},
+			act(act, value) {
+				if (act === "close") {
+					if (value === undefined) list.onCancel();
+					else if (list.submenuComponent) list.handleInput("\x1b");
+				} else if (act.startsWith("open:")) open(act.slice(5));
+				else if (act === "edit" && value) open(value);
+			},
+			change(item, value) {
+				const it = list.items.find((x) => x.id === item);
+				if (!it || value === null || value === undefined) return;
+				const next = String(value);
+				if (it.values && !it.values.includes(next)) return;
+				list.selectItem(item);
+				it.currentValue = next;
+				list.onChange(item, next);
 			},
 		};
 	};

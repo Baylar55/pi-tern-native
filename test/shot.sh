@@ -16,11 +16,13 @@ command -v cygpath >/dev/null && OUT="$(cygpath -m "$OUT")"
 LOG="${TEMP:-/tmp}/pi-tern-dev.jsonl"
 command -v cygpath >/dev/null && LOG="$(cygpath -m "$LOG")"
 rm -f "$LOG"
+# pi writes into the fixture config (settings changed in a test, changelog version): put it back afterwards
+cp "$HERE/agent/settings.json" "$OUT/settings.json.bak"
 ctl() { tern ctl --control "$PORT" "$@"; }
 
 node "$HERE/mock-llm.mjs" >"$OUT/mock.log" 2>&1 &
 MOCK=$!
-trap 'kill $MOCK 2>/dev/null' EXIT
+trap 'kill $MOCK 2>/dev/null; cp "$OUT/settings.json.bak" "$HERE/agent/settings.json"' EXIT
 sleep 1
 # a mock left over from another run would answer instead (and stall when its parent is gone)
 if ! kill -0 "$MOCK" 2>/dev/null; then echo "mock-llm did not start (port 47899 busy?):"; cat "$OUT/mock.log"; exit 1; fi
