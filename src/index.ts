@@ -770,8 +770,52 @@ export default function (pi: ExtensionAPI) {
 		if (batch.length > 0) backlog.push(batch);
 	};
 
+	/** Set when pi's layout is not the one this version reads: then the whole screen is one ansi block. */
+	let degraded: string | undefined;
+	const describeDegraded = (): TspNode[] => {
+		const out: TspNode[] = [
+			noticeNode(
+				ctxRef?.ui.theme.fg("warning", `tern-native cannot read the layout of pi ${VERSION} (${degraded}), so pi's own screen is shown below. Update pi-tern-native.`) ?? "",
+				"degraded",
+			),
+		];
+		// pi's top containers, each rendered on its own: a viewport container renders nothing as a whole,
+		// so it falls back to its children
+		const parts: Component[] = [];
+		for (const kid of (tuiRef as unknown as { children?: Component[] } | undefined)?.children ?? []) {
+			let lines: string[] = [];
+			try {
+				lines = kid.render(readerCols());
+			} catch {
+				/* skip */
+			}
+			const inner = (kid as unknown as { children?: Component[] }).children;
+			if (lines.length === 0 && Array.isArray(inner)) parts.push(...inner);
+			else parts.push(kid);
+		}
+		parts.forEach((part, i) => {
+			const node = ansiNode(part, `screen${i}-`, "pi.screen");
+			if (node) out.push(node);
+		});
+		return out;
+	};
+
 	const render = () => {
 		if (!active || !ctxRef) return;
+		if (degraded) {
+			if (!flushBacklog() || !haveCredit()) return;
+			const ops: Op[] = [];
+			try {
+				reconciler.region("main", describeDegraded(), ops);
+			} catch {
+				/* nothing more to fall back to */
+			}
+			if (ops.length > 0) {
+				queueFrames(ops);
+				flushBacklog();
+			}
+			return;
+		}
 		// Earlier frames first: the reconciler already counts them as sent.
 		if (!flushBacklog() || !haveCredit()) return;
 		let ops: Op[] = [];
@@ -842,7 +886,8 @@ export default function (pi: ExtensionAPI) {
 			return null;
 		}
 		if (lines.length === 0) return null;
-		lines = lines.map(trimRight);
+		// pi marks the editor caret with private APC sequences (ESC _pi:c BEL): not for Tern's ansi parser
+		lines = lines.map((line) => trimRight(line.replace(/\x1b_[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")));
 		const key = `${width}\n${lines.join("\n")}`;
 		const cached = nodeCache.get(comp);
 		if (cached?.key === key) return cached.node;
@@ -2866,6 +2911,10 @@ export default function (pi: ExtensionAPI) {
 			tuiRef.requestRender(true);
 			return;
 		}
+		// pi's containers are found by position: if a pi update moved them, show pi's own screen in
+		// one block under a warning instead of a broken native one (an agent block shows only surfaces).
+		degraded = process.env.PI_TERN_NATIVE_FORCE_DEGRADED === "1" ? "forced for testing" : checkLayout();
+		if (degraded) trace(`layout: ${degraded}`);
 
 		credits = typeof hello.credits === "number" && hello.credits > 0 ? hello.credits : 2;
 		apcLimit = typeof hello.apc === "number" && hello.apc > 1024 ? hello.apc : 65536;
@@ -2888,6 +2937,21 @@ export default function (pi: ExtensionAPI) {
 		openSurface();
 		reportCwd(ctx.cwd);
 		void refreshGit();
+	};
+
+	/**
+	 * The shape of pi's interactive layout this extension reads (see `containers()`): the chat
+	 * container inside the first child, and the editor container holding our composer. Returns what
+	 * does not match, or undefined when everything is where it is expected.
+	 */
+	const checkLayout = (): string | undefined => {
+		const kids = (tuiRef as unknown as { children?: unknown[] } | undefined)?.children;
+		if (!Array.isArray(kids) || kids.length < 5) return `${Array.isArray(kids) ? kids.length : "no"} top-level containers`;
+		const k = containers();
+		if (!Array.isArray(k.chat?.children)) return "no chat container";
+		if (!Array.isArray(k.editor?.children)) return "no editor container";
+		if (composer && !k.editor!.children.includes(composer)) return "the editor is not where expected";
+		return undefined;
 	};
 
 	/** OSC 7, as omp sends it: Tern then knows where the agent works. */

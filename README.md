@@ -170,6 +170,8 @@ per keystroke.
 
 - **Relies on pi internals.** It reads fields of pi's own components (for example a message component's
   `lastMessage`) and the order of the containers in pi's interactive mode, so a pi update may need small fixes.
+  The layout is checked at startup: when it is not the expected one, the surface shows a warning and pi's own
+  screen in one block instead of a broken native view (`PI_TERN_NATIVE_FORCE_DEGRADED=1` shows that mode).
 - **Not yet ported from omp:** the "Pseudo" shell view in Bash cards, and native drawing of the `/settings` submenus (they are pi's own rendering over the page).
 - **Extension overlays** are pi's own rendering inside a Tern overlay, not native widgets.
 - **Images are recognised by path:** any absolute path to an existing `.png`, `.jpg`, `.gif`, `.webp` or `.bmp`
