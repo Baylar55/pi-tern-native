@@ -2276,7 +2276,9 @@ export default function (pi: ExtensionAPI) {
 		if (settings.compaction?.enabled === false) return undefined;
 		const reserve = settings.compaction?.reserveTokens ?? 16_384;
 		const at = Math.max(0, Math.min(1, (window - reserve) / window));
-		if (at > 0.94) return undefined; // too close to the end: it would sit on the total label
+		// too close to the end, it would sit on the total label ("200K"): keep ~5 columns of room,
+		// which is 6% of a wide pane but over a tenth of a narrow one
+		if (at > 1 - Math.max(0.06, 5 / Math.max(1, cols))) return undefined;
 		return [{ at, icon: "context.compaction", title: `Auto-compact at ${Math.round(at * 100)}%` }];
 	};
 
