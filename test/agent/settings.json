@@ -1,0 +1,9 @@
+{
+  "defaultProvider": "mock",
+  "defaultModel": "mock-1",
+  "quietStartup": true,
+  "compaction": {
+    "keepRecentTokens": 50
+  },
+  "lastChangelogVersion": "1.5.2"
+}

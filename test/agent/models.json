@@ -1,0 +1,26 @@
+{
+	"providers": {
+		"mock": {
+			"baseUrl": "http://127.0.0.1:47899/v1",
+			"api": "openai-completions",
+			"apiKey": "mock",
+			"models": [
+				{
+					"id": "mock-1",
+					"name": "Mock 1",
+					"reasoning": true,
+					"contextWindow": 200000,
+					"maxTokens": 8192,
+					"cost": { "input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75 }
+				},
+				{
+					"id": "mock-2-mini",
+					"name": "Mock 2 Mini",
+					"contextWindow": 128000,
+					"maxTokens": 4096,
+					"cost": { "input": 0.5, "output": 2, "cacheRead": 0.05, "cacheWrite": 0.6 }
+				}
+			]
+		}
+	}
+}

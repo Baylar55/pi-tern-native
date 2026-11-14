@@ -2,3 +2,9 @@ node_modules/
 *.log
 *.jsonl
 .DS_Store
+
+# test/agent is an isolated pi config dir: keep only its fixtures
+test/agent/*
+!test/agent/models.json
+!test/agent/settings.json
+!test/agent/skills/
