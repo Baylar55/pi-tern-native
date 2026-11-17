@@ -44,7 +44,7 @@ import {
 	UserMessageComponent,
 	VERSION,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, type EditorTheme, Markdown, SelectList, Spacer, type TUI, Text } from "@earendil-works/pi-tui";
+import { type Component, type EditorTheme, Markdown, SelectList, SettingsList, Spacer, type TUI, Text } from "@earendil-works/pi-tui";
 import { PI_LOGO, PI_STYLES, TIPS } from "./brand.ts";
 import { ago, ansiToSpans, clock, fmtTokens, homeShort, langOf, resultText, stripAnsi, trimBlank, trimRight } from "./format.ts";
 import { IMAGE_MIME, IMAGE_PATH, imageSize, MAX_IMAGE_BYTES } from "./images.ts";
@@ -1948,28 +1948,52 @@ export default function (pi: ExtensionAPI) {
 	/**
 	 * `/settings` as Tern's native settings page (`prefs`): every setting a row, on/off settings as
 	 * switches, short value lists as segmented choices, longer ones as menus, and settings with a
-	 * submenu (thinking level, theme, …) as buttons that open it. An open submenu is pi's own
-	 * rendering, placed over the page; its keys go to pi as usual.
+	 * submenu as buttons that open it. A submenu that is itself a settings list (warnings, automatic
+	 * themes) opens as a second page of the same window, with the page before it in the sidebar to go
+	 * back; a submenu built on a SelectList (theme, per-model thinking) is a picker sheet over the
+	 * page; anything else is pi's own rendering placed on the page. Keys go to pi as usual.
 	 */
+	type SettingsItem = { id: string; label: string; description?: string; currentValue: string; values?: string[]; submenu?: unknown };
+	type SettingsListLike = {
+		items: SettingsItem[];
+		filteredItems: SettingsItem[];
+		searchEnabled?: boolean;
+		searchInput?: { getValue(): string; cursor?: number };
+		selectedIndex: number;
+		submenuComponent: Component | null;
+		onChange(id: string, value: string): void;
+		onCancel(): void;
+		selectItem(id: string): void;
+		activateItem(): void;
+		handleInput(data: string): void;
+	};
+	/** The settings list a submenu holds (its own field, or the input component it shows), if any. */
+	const settingsListIn = (comp: unknown): SettingsListLike | undefined => {
+		const c = comp as { settingsList?: unknown; inputComponent?: unknown } | undefined;
+		for (const candidate of [comp, c?.settingsList, c?.inputComponent]) {
+			if (candidate instanceof SettingsList) return candidate as unknown as SettingsListLike;
+		}
+		return undefined;
+	};
 	const settingsSheet = (sel: SettingsSelectorComponent): Sheet => {
-		type Item = { id: string; label: string; description?: string; currentValue: string; values?: string[]; submenu?: unknown };
-		const list = (sel as unknown as { settingsList: unknown }).settingsList as {
-			items: Item[];
-			filteredItems: Item[];
-			searchEnabled?: boolean;
-			searchInput?: { getValue(): string; cursor?: number };
-			selectedIndex: number;
-			submenuComponent: Component | null;
-			onChange(id: string, value: string): void;
-			onCancel(): void;
-			selectItem(id: string): void;
-			activateItem(): void;
-			handleInput(data: string): void;
-		};
+		const root = (sel as unknown as { settingsList: unknown }).settingsList as SettingsListLike;
+		// the open lists, outermost first: each level is the submenu the one before it opened
+		const levels: { list: SettingsListLike; label: string }[] = [{ list: root, label: "General" }];
+		for (;;) {
+			const parent = levels[levels.length - 1]!.list;
+			const inner = parent.submenuComponent ? settingsListIn(parent.submenuComponent) : undefined;
+			if (!inner || levels.length > 4) break;
+			const opener = (parent.searchEnabled ? parent.filteredItems : parent.items)[parent.selectedIndex];
+			levels.push({ list: inner, label: stripAnsi(opener?.label ?? "More") });
+		}
+		const depth = levels.length - 1;
+		const list = levels[depth]!.list;
 		const shown = list.searchEnabled ? list.filteredItems : list.items;
-		const isSwitch = (it: Item) => it.values?.length === 2 && it.values.includes("true") && it.values.includes("false");
-		const control = (it: Item) => {
+		const isSwitch = (it: SettingsItem) => it.values?.length === 2 && it.values.includes("true") && it.values.includes("false");
+		const control = (it: SettingsItem) => {
 			if (isSwitch(it)) return { k: "switch", on: it.currentValue === "true" };
+			// one value is a command ("save and go back"): a button that does what Enter does in pi
+			if (it.values?.length === 1) return { k: "action", label: stripAnsi(it.values[0]!), act: `open:${it.id}` };
 			if (it.values?.length) {
 				return {
 					k: "choice",
@@ -1981,24 +2005,23 @@ export default function (pi: ExtensionAPI) {
 			return { k: "action", label: stripAnsi(it.currentValue) || "Open", act: `open:${it.id}` };
 		};
 		const submenu = list.submenuComponent;
-		// a submenu built on a SelectList (theme, per-model thinking, …) is a native picker over the page;
-		// anything else is pi's own rendering placed on the page
 		const host = submenu ? selectHost(submenu) : undefined;
 		const sub = host ? selectListSheet(host, selectListOf(host)!, SUBSHEET_ID) : undefined;
 		const editor = submenu && !sub ? ansiNode(submenu, "se", "pi.settings.submenu", Math.min(54, readerCols())) : null;
 		const query = list.searchEnabled ? list.searchInput?.getValue() : undefined;
+		const pageId = (i: number) => (i === 0 ? "general" : `sub${i}`);
 		const node = n(
 			"prefs",
 			{
 				role: "omp.overlay.settings",
 				title: "pi settings",
-				pages: [{ id: "general", label: "General", icon: "settings" }],
-				page: "general",
+				pages: levels.map((l, i) => ({ id: pageId(i), label: l.label, icon: "settings" })),
+				page: pageId(depth),
 				...(query ? { query, cursor: list.searchInput?.cursor } : {}),
 				sections: [
 					{
-						id: "general",
-						title: "General",
+						id: pageId(depth),
+						title: levels[depth]!.label,
 						rows: shown.map((it) => ({
 							id: it.id,
 							label: stripAnsi(it.label),
@@ -2013,8 +2036,12 @@ export default function (pi: ExtensionAPI) {
 			editor ? [col([editor], { role: "omp.prefs.editor" }, "editor")] : undefined,
 			SHEET_ID,
 		);
+		/** Back to level `to`: Escape closes the innermost submenu, one level at a time. */
+		const backTo = (to: number) => {
+			for (let i = depth; i > to; i--) levels[i - 1]!.list.handleInput("");
+		};
 		const open = (id: string) => {
-			if (list.submenuComponent) list.handleInput("\x1b");
+			if (list.submenuComponent && !settingsListIn(list.submenuComponent)) list.handleInput("");
 			list.selectItem(id);
 			list.activateItem();
 		};
@@ -2024,13 +2051,16 @@ export default function (pi: ExtensionAPI) {
 			pick(activate, item) {
 				if (!shown.some((it) => it.id === item)) return;
 				if (activate) return open(item);
-				if (list.submenuComponent) list.handleInput("\x1b");
+				if (list.submenuComponent) list.handleInput("");
 				list.selectItem(item);
 			},
 			act(act, value) {
 				if (act === "close") {
-					if (value === undefined) list.onCancel();
-					else if (list.submenuComponent) list.handleInput("\x1b");
+					if (value === undefined) root.onCancel();
+					else if (list.submenuComponent) list.handleInput("");
+				} else if (act === "page" && value) {
+					const to = levels.findIndex((_, i) => pageId(i) === value);
+					if (to >= 0 && to < depth) backTo(to);
 				} else if (act.startsWith("open:")) open(act.slice(5));
 				else if (act === "edit" && value) open(value);
 			},
