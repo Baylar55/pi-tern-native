@@ -178,7 +178,7 @@ per keystroke.
   `lastMessage`) and the order of the containers in pi's interactive mode, so a pi update may need small fixes.
   The layout is checked at startup: when it is not the expected one, the surface shows a warning and pi's own
   screen in one block instead of a broken native view (`PI_TERN_NATIVE_FORCE_DEGRADED=1` shows that mode).
-- **Not yet ported from omp:** the "Pseudo" shell view in Bash cards.
+- **Not portable from omp:** the "Pseudo" shell view in Bash cards. omp draws it from its native shell-tracing engine, which records each step of a command as it runs; pi runs bash as a plain process, so that data does not exist.
 - **Extension overlays** are pi's own rendering inside a Tern overlay, not native widgets.
 - **Images are recognised by path:** any absolute path to an existing `.png`, `.jpg`, `.gif`, `.webp` or `.bmp`
   file in a message is shown as an image (up to 20 MB). Paths to files that no longer exist stay as text.

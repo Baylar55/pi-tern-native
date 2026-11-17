@@ -28,9 +28,17 @@ sleep 1
 if ! kill -0 "$MOCK" 2>/dev/null; then echo "mock-llm did not start (port 47899 busy?):"; cat "$OUT/mock.log"; exit 1; fi
 tern serve --control "$PORT" --out "$OUT" >"$OUT/serve.log" 2>&1 &
 for _ in $(seq 1 50); do ctl state >/dev/null 2>&1 && break; sleep 0.2; done
+# The agent command must be the bare launcher path: Tern rejects anything else and silently falls
+# back to its default agent (omp, with your real accounts), and the scenario would type into that.
 ctl agent-command "\"$HERE/${LAUNCH:-dev-launch.cmd}\"" >/dev/null
 ctl block agent >/dev/null
 sleep "${BOOT:-12}"
+# Only go on when the pane really runs the dev launcher: its pi writes the debug log and greets Tern.
+if ! grep -q '"r":"hello"' "$LOG" 2>/dev/null; then
+	echo "ABORT: the agent block is not running test/${LAUNCH:-dev-launch.cmd} (no hello in $LOG); nothing was typed"
+	ctl quit >/dev/null 2>&1
+	exit 1
+fi
 for cmd in "$@"; do
 	if [[ "$cmd" == "!"* ]]; then bash -c "${cmd:1}"   # "!..." runs a local shell command
 	else ctl "$cmd"; fi   # ctl parses one command line itself, quotes included
